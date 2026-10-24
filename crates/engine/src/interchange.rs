@@ -222,14 +222,17 @@ mod embedded_audio_tests {
     #[test]
     fn virtual_extraction_keeps_existing_media() {
         let files = Arc::new(VirtualFiles::default());
-        files.0.lock().unwrap().insert("/files/cut Audio.wav".into(), b"first".to_vec());
-        files.0.lock().unwrap().insert("/files/cut Audio (2).wav".into(), b"second".to_vec());
+        // Use host-native spelling in the virtual filesystem, just as with_file_name does.
+        let path = |name: &str| std::path::Path::new("/files").join(name).to_string_lossy().into_owned();
+        let (first, second, third) = (path("cut Audio.wav"), path("cut Audio (2).wav"), path("cut Audio (3).wav"));
+        files.0.lock().unwrap().insert(first.clone(), b"first".to_vec());
+        files.0.lock().unwrap().insert(second.clone(), b"second".to_vec());
         let session = Session::new(files.clone());
-        let path = write_embedded_audio(&session, "/files/cut Audio.wav", b"new audio").unwrap();
-        assert_eq!(path, "/files/cut Audio (3).wav");
+        let written = write_embedded_audio(&session, &first, b"new audio").unwrap();
+        assert_eq!(written, third);
         let stored = files.0.lock().unwrap();
-        assert_eq!(stored["/files/cut Audio.wav"], b"first");
-        assert_eq!(stored["/files/cut Audio (2).wav"], b"second");
-        assert_eq!(stored["/files/cut Audio (3).wav"], b"new audio");
+        assert_eq!(stored[&first], b"first");
+        assert_eq!(stored[&second], b"second");
+        assert_eq!(stored[&third], b"new audio");
     }
 }

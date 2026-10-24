@@ -578,6 +578,12 @@ pub fn invoke(app: &mut FilmcraftApp, ctx: &egui::Context, id: &str, mut params:
         app.session.set_prefs(next).map_err(|e| e.to_string())?;
         return Ok(Value::Null);
     }
+    if id == "file.import" && (params.get("paths").is_some() || params.get("path").is_some()) {
+        return app.import_paths(params, None);
+    }
+    if id == "file.open" && params.get("path").is_some() {
+        return app.open_project_path(params);
+    }
     // File dialogs for commands that need a path.
     if (id == "file.import" && params.get("paths").is_none() && params.get("path").is_none())
         || (id == "file.importImageSequence" && params.get("path").is_none())

@@ -61,6 +61,28 @@ fn probe_media(s: &Session, original: &str, document: &Path) -> std::result::Res
     Ok((canonical, source.info().clone()))
 }
 
+/// Validate destination intent before a generic import can replace the current project.
+pub(crate) fn validate_destination(p: &Value) -> Result<()> {
+    match (string(p, "destination")?, string(p, "destinationRoot")?) {
+        (Some(_), None) | (None, Some(_)) => Ok(()),
+        (None, None) => Err(bad(COMMAND, "choose destination (a new directory) or destinationRoot (an existing parent folder) explicitly")),
+        (Some(_), Some(_)) => Err(bad(COMMAND, "choose only one of destination and destinationRoot")),
+    }
+}
+
+fn unused_destination(parent: &Path, source: &Path) -> Result<PathBuf> {
+    let stem = source.file_stem().and_then(|stem| stem.to_str()).unwrap_or("Premiere");
+    for n in 1..=10000 {
+        let path = parent.join(format!("{stem}.filmcraft-import-{n}"));
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Err(error) => return Err(io(error)),
+            Ok(_) => {}
+        }
+    }
+    Err(bad(COMMAND, "choose a parent folder with an unused import destination"))
+}
+
 pub(crate) fn hash_file(path: &Path) -> Result<(String, u64)> {
     let mut f = std::fs::File::open(path).map_err(io)?;
     if !f.metadata().map_err(io)?.is_file() {
@@ -157,15 +179,10 @@ pub(super) fn import_with_hasher(s: &mut Session, p: &Value, hash: &dyn Fn(&Path
         fragment.sequences.swap(0, selected);
     }
     let source_hash = format!("{:x}", Sha256::digest(&bytes));
-    let destination = if let Some(d) = string(p, "destination")? {
-        PathBuf::from(d)
-    } else {
-        let stem = source.file_stem().and_then(|s| s.to_str()).unwrap_or("Premiere");
-        let parent = source.parent().ok_or_else(|| bad(COMMAND, "source has no parent directory"))?;
-        (1..=10000)
-            .map(|n| parent.join(format!("{stem}.filmcraft-import-{n}")))
-            .find(|p| std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound))
-            .ok_or_else(|| bad(COMMAND, "choose an unused destination directory"))?
+    validate_destination(p)?;
+    let destination = match string(p, "destination")? {
+        Some(destination) => PathBuf::from(destination),
+        None => unused_destination(Path::new(string(p, "destinationRoot")?.ok_or_else(|| bad(COMMAND, "destinationRoot is required"))?), &source)?,
     };
     let parent = destination.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).canonicalize().map_err(io)?;
     let destination = parent.join(destination.file_name().ok_or_else(|| bad(COMMAND, "destination must name a new directory"))?);
@@ -336,7 +353,7 @@ pub fn commands() -> Vec<CommandSpec> {
             label: "Import Premiere Project",
             menu: &[],
             shortcut: None,
-            params: r#"{"path":str,"destination":str? (new directory),"mediaMode":"link"|"copy","sequence":str? (ObjectUID or unique name),"frameRate":{"num":int,"den":int}?}"#,
+            params: r#"{"path":str,"destination":str? (new directory),"destinationRoot":str? (existing parent folder; choose exactly one),"mediaMode":"link"|"copy","sequence":str? (ObjectUID or unique name),"frameRate":{"num":int,"den":int}?}"#,
             enabled: always,
             run: import,
             journal: true,

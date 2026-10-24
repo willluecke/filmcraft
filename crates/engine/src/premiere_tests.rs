@@ -31,6 +31,93 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn shared_premiere_media_survives_link_copy_undo_and_reopen() {
+    let fixture = Fixture::new();
+    let source = fixture.0.join("source.prproj");
+    let xml = std::fs::read_to_string(&source).unwrap()
+        .replace("</TrackGroups>", "<TrackGroup><Second ObjectRef=\"ag\"/></TrackGroup></TrackGroups>")
+        .replace("</PremiereData>", r#"<AudioTrackGroup ObjectID="ag"><TrackGroup><Tracks><Track ObjectURef="at"/></Tracks></TrackGroup></AudioTrackGroup><AudioClipTrack ObjectUID="at"><ClipTrack><Track><Index>0</Index></Track><ClipItems><TrackItems><TrackItem ObjectRef="ai"/></TrackItems></ClipItems></ClipTrack></AudioClipTrack><AudioClipTrackItem ObjectID="ai"><ClipTrackItem><TrackItem><Start>0</Start><End>254016000000</End></TrackItem><SubClip ObjectRef="3"/></ClipTrackItem></AudioClipTrackItem></PremiereData>"#);
+    std::fs::write(&source, xml).unwrap();
+    let original = std::fs::read(&source).unwrap();
+    for mode in ["link", "copy"] {
+        let mut s = Session::default();
+        let result = s.execute("premiere.import", json!({"path":source,"destination":fixture.0.join(mode),"mediaMode":mode})).unwrap();
+        assert_eq!(result["offlineMedia"], json!([]));
+        assert_eq!(s.project.items.values().filter(|i| i.as_media().is_some()).count(), 1);
+        assert_eq!(s.project.workflow.as_ref().unwrap().imports[0].media.len(), 1);
+        let seq = s.active_sequence().unwrap();
+        assert_eq!(seq.video_tracks[0].items[0].item, seq.audio_tracks[0].items[0].item);
+        s.undo().unwrap();
+        assert!(s.project.items.is_empty());
+        s.redo().unwrap();
+        let saved = fixture.0.join(format!("{mode}.fcproj"));
+        s.execute("file.saveAs", json!({"path":saved})).unwrap();
+        s.execute("file.open", json!({"path":saved})).unwrap();
+        assert_eq!(s.project.items.values().filter(|i| i.as_media().is_some()).count(), 1);
+        let seq = s.active_sequence().unwrap();
+        assert_eq!(seq.video_tracks[0].items[0].item, seq.audio_tracks[0].items[0].item);
+    }
+    assert_eq!(std::fs::read(source).unwrap(), original);
+}
+
+#[test]
+fn open_premiere_replaces_only_after_success_and_saves_as_filmcraft() {
+    let fixture = Fixture::new();
+    let source = fixture.0.join("source.PrPrOj");
+    std::fs::rename(fixture.0.join("source.prproj"), &source).unwrap();
+    let original = std::fs::read(&source).unwrap();
+    let mut s = Session::default();
+    s.execute("file.openDemoProject", json!({})).unwrap();
+    s.execute("file.saveAs", json!({"path":fixture.0.join("previous.fcproj")})).unwrap();
+    let result = s.execute("file.open", json!({"path":source,"destinationRoot":fixture.0})).unwrap();
+    assert_eq!(result["format"], "Premiere");
+    assert_eq!(result["offlineMedia"], json!([]));
+    assert_eq!(s.project.name, "source");
+    assert_eq!(s.project.sequences().count(), 1);
+    assert_eq!(s.state.open_sequences.len(), 1);
+    assert!(s.state.source_item.is_none());
+    assert!(s.is_dirty());
+    assert!(s.path.is_none());
+    assert!(s.history.undo.is_empty());
+    assert!(s.project.workflow.is_some());
+    let converted = fixture.0.join("converted.fcproj");
+    s.execute("file.saveAs", json!({"path":converted})).unwrap();
+    s.execute("file.open", json!({"path":converted})).unwrap();
+    assert!(!s.is_dirty());
+    assert_eq!(s.project.sequences().count(), 1);
+    assert!(s.project.workflow.is_some());
+    assert_eq!(std::fs::read(source).unwrap(), original);
+}
+
+#[test]
+fn open_premiere_failure_or_unsaved_edits_preserves_current_project() {
+    let fixture = Fixture::new();
+    let mut s = Session::default();
+    s.execute("file.newBin", json!({"name":"Keep me"})).unwrap();
+    let before = s.project.clone();
+    let state = s.state.clone();
+    let revision = s.revision;
+    let params = json!({"path":fixture.0.join("source.prproj"),"destination":fixture.0.join("opened")});
+    assert!(s.execute("file.open", params.clone()).unwrap_err().to_string().contains("Save the current project"));
+    assert!(!fixture.0.join("opened").exists());
+    s.saved_revision = s.revision;
+    for options in [
+        json!({"path":fixture.0.join("source.prproj")}),
+        json!({"path":fixture.0.join("missing.prproj"),"destination":fixture.0.join("opened")}),
+        json!({"path":fixture.0.join("bad.prproj"),"destination":fixture.0.join("opened")}),
+        json!({"path":fixture.0.join("source.prproj"),"destination":fixture.0}),
+    ] {
+        std::fs::write(fixture.0.join("bad.prproj"), b"invalid project").unwrap();
+        assert!(s.execute("file.open", options).is_err());
+        assert_eq!(s.project.as_ref(), before.as_ref());
+        assert_eq!(serde_json::to_value(&s.state).unwrap(), serde_json::to_value(&state).unwrap());
+        assert_eq!(s.revision, revision);
+        assert!(s.path.is_none());
+        assert!(!fixture.0.join("opened").exists());
+    }
+}
+
+#[test]
 fn premiere_non_media_references_are_never_hashed_or_copied() {
     struct ReadCounter(AtomicU64);
     impl crate::Services for ReadCounter {
@@ -401,4 +488,16 @@ fn premiere_plain_xml_larger_than_64_mib_reaches_parser_and_snapshot() {
     assert_eq!(imports.len(), 1);
     assert_eq!(imports[0].source_sha256, before.0);
     assert_eq!(hash_file(std::path::Path::new(&imports[0].snapshot_path)).unwrap(), before);
+}
+
+#[test]
+fn missing_import_destination_never_replaces_project_or_writes_beside_source() {
+    let fixture = Fixture::new();
+    let source = fixture.0.join("source.prproj");
+    let mut session = Session::default();
+    let before = session.project.clone();
+    assert!(session.execute("premiere.import", json!({"path":source})).is_err());
+    assert!(session.execute("file.import", json!({"paths":[source],"replace":true})).is_err());
+    assert_eq!(session.project.as_ref(), before.as_ref());
+    assert!(!fixture.0.join("source.filmcraft-import-1").exists());
 }

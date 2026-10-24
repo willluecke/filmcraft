@@ -3,6 +3,11 @@
 The egui frontend draws panels and dialogs, and dispatches project changes through the engine.
 Interactive controls keep stable automation ids regardless of the interface language.
 
+Open Project accepts FilmCraft `.fcproj` and Premiere `.prproj`. Premiere opens share Import's
+remembered destination picker and convert into a separate unsaved project after successful
+conversion. Save current edits first; cancellation and conversion errors preserve the current
+project. Save stays FilmCraft-only. Synthetic engine and picker tests cover these paths.
+
 ## Transition drop previews
 
 Dragging a video or audio transition over a compatible clip shows its actual time span, the
@@ -90,3 +95,14 @@ buttons use `craft-ui::layout::fit_toolbar`; commands beyond the available width
 through More, including their selected state and Source/Program routing. A scrolling fallback
 retains all commands if even More cannot fit. `monitor_geometry` checks the painted readouts,
 control bounds, overflow actions and Source drag payloads across monitor widths and themes.
+
+### Premiere import destination
+
+File Import, UI imports with paths, launch-file imports and OS drops ask for a parent folder before
+importing `.prproj` files; ordinary media imports retain their existing behavior. The native host
+suggests OS Documents/FilmCraft/Projects on first use; the last selected parent is persisted in
+`general.premiereImportDirectory`. Every imported project gets a fresh, non-overwriting subfolder.
+Canceling a folder prompt imports nothing, including the ordinary media in a mixed batch. Native
+asynchronous hosts use the existing continuation mechanism. Source snapshots/provenance are stored
+in the chosen location; saving the editable FilmCraft project remains a separate action. CLI/MCP
+imports require an explicit destination. No writes target the app installation directory.

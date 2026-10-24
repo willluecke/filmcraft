@@ -32,6 +32,63 @@ fn fixture() -> String {
 }
 
 #[test]
+fn audio_and_video_share_one_media_item_with_complete_offline_hints() {
+    let t = filmcraft_time::TICKS_PER_SECOND;
+    for audio_first in [false, true] {
+        let mut xml = fixture().replace(
+            &format!("<AudioClip ObjectID=\"ac\"><InPoint>{t}</InPoint><OutPoint>{}</OutPoint>", 3 * t),
+            &format!("<AudioClip ObjectID=\"ac\"><InPoint>{t}</InPoint><OutPoint>{}</OutPoint>", 8 * t),
+        );
+        if audio_first {
+            xml = xml.replace(
+                "<TrackGroup><Second ObjectRef=\"vg\"/></TrackGroup><TrackGroup><Second ObjectRef=\"ag\"/></TrackGroup>",
+                "<TrackGroup><Second ObjectRef=\"ag\"/></TrackGroup><TrackGroup><Second ObjectRef=\"vg\"/></TrackGroup>",
+            );
+        }
+        // Reuse the source in another sequence as well as on both media track kinds.
+        xml = xml.replace("</PremiereData>", r#"<Sequence ObjectUID="s2"><Name>Second</Name><TrackGroups><TrackGroup><Second ObjectRef="vg"/></TrackGroup><TrackGroup><Second ObjectRef="ag"/></TrackGroup></TrackGroups></Sequence></PremiereData>"#);
+        let (p, doc, _) = import(xml.as_bytes(), &ImportOptions::default(), None).unwrap();
+        assert_eq!(doc.sequences[0].tracks[0].kind, if audio_first { "audio" } else { "video" });
+        let media: Vec<_> = p.project.items.values().filter_map(|i| i.as_media()).collect();
+        assert_eq!(media.len(), 1);
+        let m = media[0];
+        assert!(m.offline);
+        assert!(m.info.video.is_some() && !m.info.audio_streams.is_empty());
+        assert_eq!(m.info.kind, filmcraft_media::MediaKind::Movie);
+        assert_eq!(m.info.duration, Tick(8 * t));
+        let mut source_ids = std::collections::BTreeSet::new();
+        for id in &p.sequences {
+            let s = p.project.sequence(*id).unwrap();
+            let v = &s.video_tracks[0].items[0];
+            let a = &s.audio_tracks[0].items[0];
+            assert_eq!(v.item, a.item);
+            assert_eq!((v.start, v.source_in, v.duration), (Tick(3 * t), Tick(t), Tick(2 * t)));
+            assert_eq!((a.start, a.source_in, a.duration), (Tick(3 * t), Tick(t), Tick(2 * t)));
+            assert_eq!(v.link, a.link);
+            assert!(v.link.is_some());
+            assert!(a.effects.iter().any(|e| e.effect == "volume"));
+            source_ids.insert(v.item);
+        }
+        assert_eq!(source_ids.len(), 1);
+    }
+}
+
+#[test]
+fn same_label_on_distinct_paths_or_unresolved_objects_is_not_merged() {
+    let resolved = fixture().replace(
+        "<AudioClip ObjectID=\"ac\"><InPoint>",
+        "<AudioClip ObjectID=\"ac\"><Source ObjectRef=\"asource\"/><InPoint>",
+    ).replace("</PremiereData>", r#"<AudioMediaSource ObjectID="asource"><Media ObjectRef="different"/></AudioMediaSource><Media ObjectID="different"><Title>example.mov</Title><FilePath>other/example.mov</FilePath></Media></PremiereData>"#);
+    let unresolved = fixture().replace("<Media><Title>example.mov</Title><FilePath>example.mov</FilePath></Media>", "");
+    for xml in [resolved, unresolved] {
+        let (p, _, _) = import(xml.as_bytes(), &ImportOptions::default(), None).unwrap();
+        let s = p.project.sequence(p.sequences[0]).unwrap();
+        assert_ne!(s.video_tracks[0].items[0].item, s.audio_tracks[0].items[0].item);
+        assert_eq!(p.project.items.values().filter(|i| i.as_media().is_some()).count(), 2);
+    }
+}
+
+#[test]
 fn sequence_audio_rate_comes_from_audio_group_not_video_or_default() {
     let (p, _, _) = import(fixture().as_bytes(), &ImportOptions::default(), None).unwrap();
     let s = p.project.sequence(p.sequences[0]).unwrap();

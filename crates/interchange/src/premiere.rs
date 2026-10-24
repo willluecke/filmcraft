@@ -709,6 +709,31 @@ pub fn import(bytes: &[u8], opts: &ImportOptions, rate: Option<FrameRate>) -> Re
         sequences.insert(seq.object_uid.clone(), id);
         b.top.push(id);
     }
+    // One source file can supply both video and audio on several tracks/sequences.
+    // Gather both stream hints before creating its single bin item, including when audio
+    // appears first. Offline placeholders remain keyed by their source object ID.
+    let mut media_specs = BTreeMap::<String, MediaSpec>::new();
+    for src in &doc.sequences {
+        let fps = rate.or(src.frame_rate).unwrap_or(FrameRate::FPS_24);
+        for track in &src.tracks {
+            if track.kind == "caption" {
+                continue;
+            }
+            for item in &track.items {
+                if item.nested_sequence.is_some() || item.graphic || item.text.is_some() {
+                    continue;
+                }
+                let path = item.media_path.clone().unwrap_or_else(|| format!("__missing_premiere__/{}", item.object_id));
+                let spec = media_specs.entry(path).or_default();
+                spec.duration = Some(spec.duration.unwrap_or(Tick::ZERO).max(item.source_out));
+                if track.kind == "audio" {
+                    spec.audio.get_or_insert((48000, 2));
+                } else {
+                    spec.video.get_or_insert((src.width, src.height, fps));
+                }
+            }
+        }
+    }
     for src in &doc.sequences {
         let fps = rate.or(src.frame_rate).unwrap_or(FrameRate::FPS_24);
         let mut settings = settings_for(fps, src.width, src.height, false);
@@ -755,13 +780,8 @@ pub fn import(bytes: &[u8], opts: &ImportOptions, rate: Option<FrameRate>) -> Re
                     b.p.add_item(&item.label, Label::Lavender, ItemKind::Graphic { width: src.width, height: src.height, rate: fps }, None)
                 } else {
                     let path = item.media_path.clone().unwrap_or_else(|| format!("__missing_premiere__/{}", item.object_id));
-                    let spec = MediaSpec {
-                        duration: Some(item.source_out),
-                        video: (kind == TrackKind::Video).then_some((src.width, src.height, fps)),
-                        audio: (kind == TrackKind::Audio).then_some((48000, 2)),
-                        ..Default::default()
-                    };
-                    let id = b.file_media(&format!("{}:{path}", track.kind), &item.label, &path, &spec, None);
+                    let spec = media_specs.get(&path).ok_or_else(|| error("missing Premiere media specification"))?;
+                    let id = b.file_media(&path, &item.label, &path, spec, None);
                     if let Some(pi) = b.p.item_mut(id)
                         && let ItemKind::Media(m) = &mut pi.kind
                     {

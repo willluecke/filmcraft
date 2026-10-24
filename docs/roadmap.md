@@ -1,6 +1,6 @@
 # Roadmap detail
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-23 · **Change:** minor (bounded Premiere import; remaining fidelity gaps explicit; M8 Fujifilm colour spaces retained) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
+> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-24 · **Change:** minor (Premiere opening, destination choice and shared media entries; remaining fidelity gaps explicit; M8 Fujifilm colour spaces retained) · **Target:** Adobe Premiere Pro 2026 (26.5.2)
 
 Forward-looking plan: milestones with status, the current focus and what's next, with estimates in
 Opus 5.5 agent-hours (calibration in [target-app-parity.md](target-app-parity.md#calibration)).
@@ -8,6 +8,13 @@ The one-page summary is [ROADMAP.md](../ROADMAP.md); the ranked work list is [ga
 There is no `cargo xtask scorecard` or `cargo xtask parity` yet ([G7](gaps.md#g7-no-measured-parity-tool-in-ci)).
 
 ## Current focus
+
+Premiere folder-picker follow-up: Open Project accepts `.prproj` through the same destination
+selection as Import, converting into a separate unsaved FilmCraft project. Cancellation and
+failed conversions preserve the current project; existing edits must be saved first. This
+changes the entry point only; importer fidelity limits remain in [premiere-import.md](premiere-import.md).
+Audio/video uses of the same Premiere media path now share one bin entry per import, preserving
+their separate timeline clips and offline stream hints. Existing saved projects retain their entries.
 
 In order. Each item links to its gap entry, which says what "done" means.
 

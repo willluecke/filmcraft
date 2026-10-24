@@ -13,10 +13,30 @@ filmcraft-cli --save-as /path/to/episode.fcproj exec premiere.import \
 ```
 
 The same JSON command works through MCP `command_run` or the desktop control channel.
-File → Import and `filmcraft-cli import source.prproj` also dispatch to this importer. Their
-default is linked media and a new `source.filmcraft-import-N` directory beside the source project.
-Use the explicit command for a custom destination, copied media or frame rate. Existing destination
-directories are refused. `sequence` optionally chooses the active sequence by ObjectUID or unique
+Desktop File → Import and OS file drops ask for a parent folder before importing any files.
+File → Open Project also accepts `.prproj` (including uppercase extensions), then asks for the
+same destination. Open converts into a separate, unsaved FilmCraft project; Import adds sequences
+to the current project. Save current edits before opening a Premiere project. Canceling either
+picker or a failed conversion preserves the current project. Save/Save As writes `.fcproj`, never
+overwrites the Premiere source, and initially suggests the chosen import folder.
+Headless `file.open` accepts the same explicit destination and media-mode options as `premiere.import`.
+Within one import, audio and video uses of the same resolved media path share one Project-bin
+entry across tracks and sequences. Their timeline clips, links, effects and timing stay separate.
+Offline media retains both audio/video hints and the longest referenced source duration. Distinct
+paths and unresolved source objects remain distinct. Repeated Import commands still add separate
+imports; Open Project converts into a separate project. Existing saved projects are not deduplicated.
+The first suggestion is the operating system's Documents directory under `FilmCraft/Projects`;
+after selection, the chosen parent is remembered in user preferences. Each project gets a new,
+unused `<source>.filmcraft-import-N` subfolder there. Existing files, folders and symlinks are not
+overwritten. Canceling the picker leaves the project and source files untouched, including mixed
+media/project batches. First use may create the empty managed projects folder before the picker.
+This folder holds the source snapshot and import records; the editable `.fcproj` still uses the
+normal Save/Save As workflow, initially suggesting that import subfolder. Linked media stays in place.
+
+CLI/MCP callers must provide either a new `destination` explicitly with `premiere.import` (example above)
+or `file.import`, or an existing `destinationRoot` parent in which the engine chooses an unused
+import subfolder. These options are mutually exclusive. A bare `filmcraft-cli import source.prproj` reports the missing destination and
+does not create folders beside the source. Existing destination directories are refused. `sequence` optionally chooses the active sequence by ObjectUID or unique
 name; an ambiguous requested name requires its ObjectUID. All sequences
 are imported. Without it, the sequence with the most video items wins; “Sequence 01” is only
 a tie-break, followed by the latest video end time.

@@ -58,6 +58,8 @@ pub struct GeneralPrefs {
     pub show_mask_tracker_preview: bool,
     /// Most recently opened / saved projects (newest first; not shown in the dialog).
     pub recent_projects: Vec<String>,
+    /// Last user-selected parent folder for Premiere import snapshots, independent of projects.
+    pub premiere_import_directory: String,
 }
 
 impl Default for GeneralPrefs {
@@ -80,6 +82,7 @@ impl Default for GeneralPrefs {
             show_project_bin_in_tab: true,
             show_mask_tracker_preview: true,
             recent_projects: Vec::new(),
+            premiere_import_directory: String::new(),
         }
     }
 }

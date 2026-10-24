@@ -54,6 +54,7 @@ pub mod panels;
 pub mod perf;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod play_ahead;
+mod premiere_destination;
 mod rtl;
 pub mod scrub;
 mod shuttle;
@@ -125,6 +126,8 @@ pub struct AudioDevices {
 /// Host hooks for native file dialogs etc.
 #[derive(Default)]
 pub struct HostHooks {
+    /// Writable user projects folder suggested for the first Premiere import.
+    pub projects_directory: Option<String>,
     pub pick_files: Option<Box<dyn FnMut(&[&str]) -> Vec<String>>>,
     /// The cursor in physical screen pixels. Where the windowing layer reports no pointer while files are dragged in from the OS (Windows), a drop is placed where this says it landed.
     pub cursor_screen_position: Option<Box<dyn Fn() -> Option<(i32, i32)>>>,
@@ -1373,7 +1376,7 @@ impl FilmcraftApp {
                         return Ok(Value::Null);
                     }
                     let bin = bin.unwrap_or_else(|| json!(app.import_bin().0));
-                    let r = app.session.execute("file.import", json!({"paths": paths, "bin": bin})).map_err(|e| e.to_string());
+                    let r = app.import_paths(json!({"paths": paths, "bin": bin}), None);
                     if let Ok(v) = &r
                         && let Some(errs) = v.get("errors").and_then(Value::as_array)
                         && !errs.is_empty()
@@ -1395,6 +1398,25 @@ impl FilmcraftApp {
             "file.saveAs" | "file.save" | "file.saveCopy" => {
                 let suggested =
                     if id == "file.saveCopy" { format!("{} copy.fcproj", self.session.project.name) } else { format!("{}.fcproj", self.session.project.name) };
+                // An unsaved imported project starts Save As beside its owned source snapshot.
+                // This is only a suggestion: no project is saved until the user confirms the dialog.
+                let suggested = if self.session.path.is_none() {
+                    self.session
+                        .project
+                        .workflow
+                        .as_ref()
+                        .and_then(|workflow| workflow.imports.last())
+                        .and_then(|import| std::path::Path::new(&import.snapshot_path).parent())
+                        .map(|parent| {
+                            parent
+                                .join(std::path::Path::new(&suggested).file_name().unwrap_or(std::ffi::OsStr::new("Untitled.fcproj")))
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                        .unwrap_or(suggested)
+                } else {
+                    suggested
+                };
                 let cmd = if id == "file.saveCopy" { "file.saveCopy" } else { "file.saveAs" };
                 self.pick(FileDialog::SaveProject { name: suggested }, move |app, paths| {
                     let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
@@ -1403,7 +1425,7 @@ impl FilmcraftApp {
             }
             "file.open" => self.pick(FileDialog::OpenProject, |app, paths| {
                 let Some(path) = paths.into_iter().next() else { return Ok(Value::Null) };
-                app.session.execute("file.open", json!({"path": path})).map_err(|e| e.to_string())
+                app.open_project_path(json!({"path": path}))
             }),
             "graphics.newFromFile" => {
                 let exts: Vec<&str> = filmcraft_media::STILL_EXTENSIONS.iter().chain(filmcraft_media::VIDEO_EXTENSIONS).copied().collect();
@@ -1489,16 +1511,8 @@ impl FilmcraftApp {
         }
         if !paths.is_empty() {
             let pointer = self.drop_pointer(ctx);
-            let imported = self.session.execute("file.import", json!({"paths": paths, "bin": self.import_bin().0}));
-            if let Ok(v) = imported
-                && let Some(pos) = pointer
-                && self.session.prefs.timeline.drop_import_to_timeline
-            {
-                let items: Vec<filmcraft_engine::project::ItemId> =
-                    v["items"].as_array().map(|a| a.iter().filter_map(|i| i.as_u64()).map(filmcraft_engine::project::ItemId).collect()).unwrap_or_default();
-                if !items.is_empty() {
-                    self.pending_timeline_drop = Some((items, pos));
-                }
+            if let Err(error) = self.import_paths(json!({"paths": paths, "bin": self.import_bin().0}), pointer) {
+                self.ui.status = error;
             }
         }
     }

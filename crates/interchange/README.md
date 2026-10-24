@@ -89,6 +89,11 @@ OMF carries no video at all.
 
 ## Tests
 
+Premiere media entries are shared by resolved path across video/audio tracks and sequences.
+The importer gathers both stream hints and the longest source range before building the entry,
+including audio-first documents and offline media. Timeline placement, links and effects remain
+per clip. Synthetic regressions also keep distinct paths and unresolved source objects separate.
+
 - `tests/it/aaf_omf.rs`: AAF round trips at 25, 29.97 DF, 23.976 and 59.94 DF (clips, gaps,
   two-sided and one-sided transitions, links, markers, start timecodes, constant and keyframed
   gain, media markers and timecode); 512-byte sectors; breakout to mono; embedded trimmed audio
