@@ -402,3 +402,100 @@ fn premiere_plain_xml_larger_than_64_mib_reaches_parser_and_snapshot() {
     assert_eq!(imports[0].source_sha256, before.0);
     assert_eq!(hash_file(std::path::Path::new(&imports[0].snapshot_path)).unwrap(), before);
 }
+
+#[test]
+fn premiere_missing_absolute_media_falls_back_to_the_relative_path_through_policy() {
+    let fixture = Fixture::new();
+    let doc = fixture.0.join("source.prproj");
+    let original = fixture.0.join("source.png");
+    let moved = fixture.0.join("moved-away").join("source.png");
+    let xml = std::fs::read_to_string(&doc).unwrap();
+    for (relative, online) in [("source.png", true), ("file://192.0.2.1/share/source.png", false)] {
+        let edited = xml.replace(
+            &format!("<FilePath>{}</FilePath>", original.display()),
+            &format!("<FilePath>{}</FilePath><RelativePath>{relative}</RelativePath>", moved.display()),
+        );
+        assert_ne!(edited, xml);
+        std::fs::write(&doc, edited).unwrap();
+        let mut s = Session::default();
+        let result = s.execute("premiere.import", json!({"path":doc,"destination":fixture.0.join(format!("relative-{online}"))})).unwrap();
+        let media = &s.project.workflow.as_ref().unwrap().imports[0].media[0];
+        let report: Vec<_> = result["report"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+        if online {
+            assert_eq!(result["offlineMedia"], json!([]), "{report:?}");
+            assert_eq!(std::path::Path::new(&media.original_path).canonicalize().unwrap(), original.canonicalize().unwrap());
+            assert!(report.iter().any(|w| w.contains("project-relative")), "{report:?}");
+        } else {
+            assert_eq!(result["offlineMedia"], json!(["source.png"]));
+            assert!(report.iter().any(|w| w.contains("document path refused")), "{report:?}");
+            assert!(media.sha256.is_none() && media.bytes.is_none());
+        }
+    }
+}
+
+#[test]
+fn premiere_media_whose_name_differs_only_in_case_is_found() {
+    // A project saved on Windows or macOS stores `source.png` for a file that a case-sensitive
+    // disk holds as `source.PNG`.
+    let fixture = Fixture::new();
+    let doc = fixture.0.join("source.prproj");
+    std::fs::rename(fixture.0.join("source.png"), fixture.0.join("source.PNG")).unwrap();
+    let mut s = Session::default();
+    let result = s.execute("premiere.import", json!({"path":doc,"destination":fixture.0.join("case")})).unwrap();
+    let report: Vec<_> = result["report"].as_array().unwrap().iter().map(|w| w.as_str().unwrap().to_string()).collect();
+    assert_eq!(result["offlineMedia"], json!([]), "{report:?}");
+    if cfg!(target_os = "linux") {
+        assert!(report.iter().any(|w| w.contains("differs only in letter case")), "{report:?}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn premiere_case_fallback_refuses_an_ambiguous_name() {
+    let fixture = Fixture::new();
+    let doc = fixture.0.join("source.prproj");
+    std::fs::rename(fixture.0.join("source.png"), fixture.0.join("source.PNG")).unwrap();
+    std::fs::copy(fixture.0.join("source.PNG"), fixture.0.join("Source.png")).unwrap();
+    let mut s = Session::default();
+    let result = s.execute("premiere.import", json!({"path":doc,"destination":fixture.0.join("ambiguous")})).unwrap();
+    assert_eq!(result["offlineMedia"], json!(["source.png"]));
+}
+
+#[test]
+fn premiere_generated_media_is_not_probed_as_a_file() {
+    // Hand-written: black video stores its four-character code (`BLAK`) as its file path.
+    let fixture = Fixture::new();
+    let doc = fixture.0.join("source.prproj");
+    let xml = std::fs::read_to_string(&doc).unwrap();
+    let code = u32::from_be_bytes(*b"BLAK");
+    let edited = xml
+        .replace("<SubClip ObjectID=\"3\"><Name>source.png</Name></SubClip>", "<SubClip ObjectID=\"3\"><Name>Vídeo negro</Name><Clip ObjectRef=\"4\"/></SubClip><VideoClip ObjectID=\"4\"><Clip><Source ObjectRef=\"5\"/></Clip></VideoClip><VideoMediaSource ObjectID=\"5\"><MediaSource><Media ObjectURef=\"m\"/></MediaSource></VideoMediaSource>")
+        .replace(&format!("<Media><Title>source.png</Title><FilePath>{}</FilePath></Media>", fixture.0.join("source.png").display()), &format!("<Media ObjectUID=\"m\"><Title>Vídeo negro</Title><FilePath>{code}</FilePath></Media>"));
+    assert_ne!(edited, xml);
+    std::fs::write(&doc, edited).unwrap();
+    let mut s = Session::default();
+    let result = s.execute("premiere.import", json!({"path":doc,"destination":fixture.0.join("generated")})).unwrap();
+    assert_eq!(result["offlineMedia"], json!([]), "{result}");
+    assert!(s.project.workflow.as_ref().unwrap().imports[0].media.is_empty(), "no file reference is recorded");
+    assert!(s.project.items.values().any(|i| matches!(&i.kind, filmcraft_project::ItemKind::Media(m)
+        if m.media == filmcraft_project::MediaRef::Generator(filmcraft_media::Generator::BlackVideo))));
+}
+
+#[test]
+fn premiere_project_with_binned_media_and_no_sequence_imports() {
+    // Hand-written: a bin holding one probed media file; the project has no sequence.
+    let fixture = Fixture::new();
+    let doc = fixture.0.join("source.prproj");
+    let xml = format!(
+        r#"<PremiereData><Project ObjectID="p"><RootProjectItem ObjectURef="root"/></Project><RootProjectItem ObjectUID="root"><ProjectItemContainer><Items><Item ObjectURef="bin"/></Items></ProjectItemContainer></RootProjectItem><BinProjectItem ObjectUID="bin"><ProjectItem><Name>Stills</Name></ProjectItem><ProjectItemContainer><Items><Item ObjectURef="item"/></Items></ProjectItemContainer></BinProjectItem><ClipProjectItem ObjectUID="item"><ProjectItem><Name>source.png</Name></ProjectItem><MasterClip ObjectURef="master"/></ClipProjectItem><MasterClip ObjectUID="master"><Clips><Clip ObjectRef="clip"/></Clips></MasterClip><VideoClip ObjectID="clip"><Clip><Source ObjectRef="source"/></Clip></VideoClip><VideoMediaSource ObjectID="source"><MediaSource><Media ObjectURef="media"/></MediaSource></VideoMediaSource><Media ObjectUID="media"><Title>source.png</Title><FilePath>{}</FilePath></Media></PremiereData>"#,
+        fixture.0.join("source.png").display()
+    );
+    std::fs::write(&doc, xml).unwrap();
+    let mut s = Session::default();
+    let result = s.execute("premiere.import", json!({"path":doc,"destination":fixture.0.join("binned")})).unwrap();
+    assert_eq!((result["sequences"].clone(), result["offlineMedia"].clone()), (json!([]), json!([])), "{result}");
+    let item = s.project.items.values().find(|i| i.name == "source.png").unwrap();
+    let bin = s.project.root.parent_of(item.id).and_then(|b| s.project.root.find_bin(b)).unwrap();
+    assert_eq!(bin.name, "Stills");
+    assert_eq!(s.project.workflow.as_ref().unwrap().imports[0].media.len(), 1, "probed through the import policy");
+}

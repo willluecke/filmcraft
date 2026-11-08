@@ -48,6 +48,10 @@ mod fidelity_tests;
 #[path = "premiere_picture_tests.rs"]
 mod picture_tests;
 
+#[cfg(test)]
+#[path = "premiere_truth_tests.rs"]
+mod truth_tests;
+
 #[path = "premiere_color.rs"]
 mod color;
 
@@ -57,10 +61,62 @@ mod motion;
 #[path = "premiere_audio.rs"]
 mod audio;
 
+#[path = "premiere_markers.rs"]
+mod markers;
+
+#[path = "premiere_items.rs"]
+mod items;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Document {
     pub sequences: Vec<Sequence>,
     pub media: BTreeMap<String, String>,
+    /// Resolved media path → its project-relative `RelativePath`, resolved against the project
+    /// folder: the fallback for a stored absolute path that is missing on this computer.
+    #[serde(default)]
+    pub relative_media: BTreeMap<String, String>,
+    /// The project panel's bins, parents before children; smart/search bins are not included.
+    #[serde(default)]
+    pub bins: Vec<SourceBin>,
+    /// Project panel items: sequences, media, subclips and adjustment layers, in panel order.
+    #[serde(default)]
+    pub items: Vec<ProjectEntry>,
+}
+/// A project panel bin; `parent` indexes [`Document::bins`] (none: the root bin).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SourceBin {
+    pub name: String,
+    pub parent: Option<usize>,
+}
+/// A project panel item: a master clip's source and, for a subclip, its range of that media.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectEntry {
+    pub name: String,
+    /// Its bin, indexing [`Document::bins`] (none: the root bin).
+    #[serde(default)]
+    pub bin: Option<usize>,
+    pub media_path: Option<String>,
+    #[serde(default)]
+    pub synthetic: Option<SyntheticMedia>,
+    /// A sequence's ObjectUID.
+    #[serde(default)]
+    pub nested_sequence: Option<String>,
+    /// An adjustment layer's `MasterClip` ObjectUID, and its clip's out point.
+    #[serde(default)]
+    pub adjustment_layer: Option<String>,
+    #[serde(default)]
+    pub duration: Option<Tick>,
+    /// Whether the master clip's media source is video (otherwise audio).
+    pub video: bool,
+    #[serde(default)]
+    pub subclip: Option<SubclipRange>,
+}
+/// A subclip's media ticks; `hard` is Restrict Trims To Subclip Boundaries (`BoundariesAreHard`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubclipRange {
+    pub start: Tick,
+    pub end: Tick,
+    pub hard: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Sequence {
@@ -73,6 +129,8 @@ pub struct Sequence {
     #[serde(default)]
     pub sample_rate: Option<u32>,
     pub work_out: Tick,
+    #[serde(default)]
+    pub markers: Vec<filmcraft_project::Marker>,
     pub tracks: Vec<Track>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -80,6 +138,11 @@ pub struct Track {
     pub kind: String,
     pub index: usize,
     pub muted: bool,
+    /// The stored track name; absent for tracks keeping Premiere's default name.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub locked: bool,
     pub items: Vec<Item>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -93,6 +156,9 @@ pub struct Item {
     pub video_effects: Vec<filmcraft_project::EffectInstance>,
     #[serde(default)]
     pub graphic: bool,
+    /// Clip > Enable turned off (`ClipTrackItem/IsMuted`).
+    #[serde(default)]
+    pub disabled: bool,
     pub label: String,
     pub start: Tick,
     pub end: Tick,
@@ -100,6 +166,15 @@ pub struct Item {
     pub source_out: Tick,
     pub speed: f64,
     pub media_path: Option<String>,
+    /// Media Premiere generates itself (black video, colour matte...), in place of a file path.
+    #[serde(default)]
+    pub synthetic: Option<SyntheticMedia>,
+    /// The `MasterClip` ObjectUID of an adjustment layer (`IsAdjustmentLayer`).
+    #[serde(default)]
+    pub adjustment_layer: Option<String>,
+    /// Markers of the source media's master clip, on the first timeline item that uses it.
+    #[serde(default)]
+    pub media_markers: Vec<filmcraft_project::Marker>,
     pub nested_sequence: Option<String>,
     pub text: Option<String>,
     pub audio_category: Option<String>,
@@ -110,6 +185,13 @@ pub struct Item {
     pub transitions: Vec<SourceTransition>,
 }
 
+/// Generated media: the four-character code Premiere stores as its file path (`BLAK` is stored
+/// as 1112293707), and the `Media` object it belongs to. Titles are UI-language text.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyntheticMedia {
+    pub code: String,
+    pub media: String,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SourceTransition {
     #[serde(default)]
@@ -168,6 +250,14 @@ fn ticks(s: Option<&str>, fallback: Tick) -> Result<Tick> {
     Ok(tick)
 }
 
+/// Width and height of a `FrameRect` (`left,top,right,bottom`).
+fn frame_rect_size(rect: &str) -> Result<(u32, u32)> {
+    let v: Vec<i64> = rect.split(',').map(|f| f.trim().parse::<i64>()).collect::<std::result::Result<_, _>>().map_err(|_| error("invalid frame rectangle"))?;
+    let [left, top, right, bottom] = v[..] else { return Err(error("invalid frame rectangle")) };
+    let w = u32::try_from(right.checked_sub(left).ok_or_else(|| error("invalid frame rectangle"))?).map_err(|_| error("invalid frame rectangle"))?;
+    let h = u32::try_from(bottom.checked_sub(top).ok_or_else(|| error("invalid frame rectangle"))?).map_err(|_| error("invalid frame rectangle"))?;
+    Ok((w, h))
+}
 fn dimension(s: Option<&str>, default: u32) -> Result<u32> {
     match s {
         None | Some("0") => Ok(default),
@@ -204,8 +294,58 @@ fn source_target<'a, 'i>(
     Ok(Some(node))
 }
 
+/// The stored absolute path, or the project-relative `RelativePath` when the absolute path was
+/// saved on another system (a macOS project opened on Windows, or the reverse).
 fn media_path(n: Node<'_, '_>, base_dir: Option<&str>) -> Option<String> {
-    child_text(n, "ActualMediaFilePath").or_else(|| child_text(n, "FilePath")).filter(|p| !p.is_empty()).map(|p| crate::resolve_path(p, base_dir))
+    if synthetic_code(n).is_some() {
+        return None;
+    }
+    let stored = child_text(n, "ActualMediaFilePath").or_else(|| child_text(n, "FilePath")).filter(|p| !p.is_empty())?;
+    if let (Some(base), Some(relative)) = (base_dir, relative_media_path(n, base_dir))
+        && foreign_absolute(stored, base)
+    {
+        return Some(relative);
+    }
+    Some(crate::resolve_path(stored, base_dir))
+}
+
+/// The four-character code generated media stores as its decimal "file path", if it has one.
+fn synthetic_code(n: Node<'_, '_>) -> Option<String> {
+    let stored = child_text(n, "ActualMediaFilePath").or_else(|| child_text(n, "FilePath"))?.trim();
+    if stored.is_empty() || !stored.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let code = stored.parse::<u32>().ok()?.to_be_bytes();
+    code.iter().all(u8::is_ascii_alphanumeric).then(|| code.iter().map(|&b| char::from(b)).collect())
+}
+
+/// FilmCraft's generator for a Premiere generated-media code. A colour matte's colour is not read.
+fn generator(code: &str) -> Option<filmcraft_media::Generator> {
+    use filmcraft_media::Generator;
+    match code {
+        "BLAK" => Some(Generator::BlackVideo),
+        "COLR" => Some(Generator::ColorMatte { color: [0.0, 0.0, 0.0, 1.0] }),
+        "TRNV" => Some(Generator::TransparentVideo),
+        "LEAD" => Some(Generator::CountingLeader),
+        "BARS" => Some(Generator::BarsAndTone),
+        _ => None,
+    }
+}
+
+fn relative_media_path(n: Node<'_, '_>, base_dir: Option<&str>) -> Option<String> {
+    let base = base_dir.filter(|b| !b.is_empty())?;
+    // Premiere sometimes writes a path on another drive as `..\..\C:\...`: joining that to the
+    // project folder names a place that never existed, so such a value is not used.
+    let drive = |seg: &str| matches!(seg.as_bytes(), [letter, b':'] if letter.is_ascii_alphabetic());
+    child_text(n, "RelativePath").filter(|r| !r.is_empty() && !r.split(['/', '\\']).any(drive)).map(|r| crate::resolve_path(r, Some(base)))
+}
+
+/// Whether `path` is an absolute path of the other system family than `base` (POSIX against a
+/// Windows drive or share, or the reverse).
+fn foreign_absolute(path: &str, base: &str) -> bool {
+    let windows = |p: &str| matches!(p.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()) || p.starts_with(r"\\");
+    let posix = |p: &str| p.starts_with('/') && !p.starts_with("//");
+    (posix(path) && windows(base)) || (windows(path) && posix(base))
 }
 
 /// Stable identifiers observed in user-owned XML. Display names remain diagnostic text only.
@@ -313,6 +453,7 @@ pub fn read(bytes: &[u8], base_dir: Option<&str>, report: &mut Report) -> Result
     let mut names = BTreeMap::new();
     let mut sequence_count = 0usize;
     let mut media = BTreeMap::new();
+    let mut relative_media = BTreeMap::new();
     let mut ambiguous = BTreeSet::new();
     for n in root.children().filter(Node::is_element) {
         for (attr, map) in [("ObjectID", &mut ids), ("ObjectUID", &mut uids)] {
@@ -331,8 +472,23 @@ pub fn read(bytes: &[u8], base_dir: Option<&str>, report: &mut Report) -> Result
         if n.has_tag_name("Media") {
             if child_text(n, "Title").is_some_and(|s| s.len() > 4096)
                 || child_text(n, "ActualMediaFilePath").or_else(|| child_text(n, "FilePath")).is_some_and(|s| s.len() > 16384)
+                || child_text(n, "RelativePath").is_some_and(|s| s.len() > 16384)
             {
                 return Err(error("media title or path is too long"));
+            }
+            if let (Some(path), Some(relative)) = (media_path(n, base_dir), relative_media_path(n, base_dir))
+                && path != relative
+            {
+                // One stored path saved with different relative paths has no single fallback.
+                match relative_media.get(&path) {
+                    None => {
+                        relative_media.insert(path, Some(relative));
+                    }
+                    Some(Some(known)) if *known != relative => {
+                        relative_media.insert(path, None);
+                    }
+                    Some(_) => {}
+                }
             }
             if let (Some(title), Some(path)) = (child_text(n, "Title"), media_path(n, base_dir)) {
                 if media.get(title).is_some_and(|p| p != &path) {
@@ -367,15 +523,18 @@ pub fn read(bytes: &[u8], base_dir: Option<&str>, report: &mut Report) -> Result
         }
     }
     let mut sequences = Vec::new();
+    let mut marker_owners = std::collections::HashSet::new();
     let mut item_count = 0usize;
     let mut skipped_items = BTreeSet::new();
     let mut unsupported_effects = BTreeMap::new();
     for n in root.children().filter(|n| n.has_tag_name("Sequence")) {
         spend(&mut work_left, n)?;
         let name = child_text(n, "Name").unwrap_or("Sequence").to_string();
-        let width = dimension(value(n, "MZ.Sequence.PreviewFrameSizeWidth"), 1920)?;
-        let height = dimension(value(n, "MZ.Sequence.PreviewFrameSizeHeight"), 1080)?;
-        filmcraft_project::validate_frame_size(width, height).map_err(error)?;
+        // The sequence frame is the video track group's `FrameRect`; the preview size is only the
+        // fallback (it can differ: a 2560x1440 sequence previewing at 1920x1080).
+        let mut width = dimension(value(n, "MZ.Sequence.PreviewFrameSizeWidth"), 1920)?;
+        let mut height = dimension(value(n, "MZ.Sequence.PreviewFrameSizeHeight"), 1080)?;
+        let mut frame_rect: Option<(u32, u32)> = None;
         let mut frame_rate = None;
         let mut sample_rate = None;
         let mut tracks = Vec::new();
@@ -406,6 +565,15 @@ pub fn read(bytes: &[u8], base_dir: Option<&str>, report: &mut Report) -> Result
                 }
                 frame_rate = Some(rate);
             }
+            if group.has_tag_name("VideoTrackGroup")
+                && let Some(rect) = child_text(group, "FrameRect")
+            {
+                let size = frame_rect_size(rect)?;
+                if frame_rect.is_some_and(|previous| previous != size) {
+                    return Err(error(format!("{name}: conflicting video track group frame sizes")));
+                }
+                frame_rect = Some(size);
+            }
             if group.has_tag_name("AudioTrackGroup")
                 && let Some(rate) = child(group, "TrackGroup").and_then(|g| child(g, "FrameRate"))
             {
@@ -432,7 +600,19 @@ pub fn read(bytes: &[u8], base_dir: Option<&str>, report: &mut Report) -> Result
                 if tracks.iter().any(|t: &Track| t.kind == kind && t.index == index) {
                     return Err(error("duplicate track index"));
                 }
-                let muted = value(track, "IsMuted").is_some_and(|s| s.eq_ignore_ascii_case("true") || s == "1");
+                let muted = value(track, "IsMuted").is_some_and(|s| s.eq_ignore_ascii_case("true") || s == "1")
+                    || (kind == "audio" && audio::fader_muted(track, &ids, &mut work_left, report, &name)?);
+                let base = child(track, "ClipTrack").and_then(|c| child(c, "Track"));
+                let locked = base.and_then(|b| child_text(b, "IsLocked")).is_some_and(|s| s.eq_ignore_ascii_case("true") || s == "1");
+                let track_name = base
+                    .and_then(|b| child(b, "Node"))
+                    .and_then(|n| child(n, "Properties"))
+                    .and_then(|p| child_text(p, "MZ.TrackName"))
+                    .filter(|s| !s.trim().is_empty());
+                if track_name.is_some_and(|s| s.len() > 4096) {
+                    return Err(error("track name is too long"));
+                }
+                let track_name = track_name.map(str::to_string);
                 let mut items = Vec::new();
                 for pointer in track.descendants().filter(|n| n.has_tag_name("TrackItem") && n.attribute("ObjectRef").is_some()) {
                     let Some(item) = referred(Some(pointer), &ids, "ObjectRef") else {
@@ -460,7 +640,12 @@ pub fn read(bytes: &[u8], base_dir: Option<&str>, report: &mut Report) -> Result
                     if let Some(clip) = clip {
                         spend(&mut work_left, clip)?;
                     }
-                    let source_in = ticks(clip.and_then(|s| value(s, "InPoint")), Tick::ZERO)?;
+                    let mut source_in = signed_ticks(clip.and_then(|s| value(s, "InPoint")), Tick::ZERO)?;
+                    if source_in < Tick::ZERO {
+                        // A slip past the source's first frame stores a negative in point.
+                        warning(report, format!("{label}: in point precedes the source start; clip starts at the source start"));
+                        source_in = Tick::ZERO;
+                    }
                     let source_out = match clip.and_then(|s| value(s, "OutPoint")) {
                         Some(raw) => ticks(Some(raw), Tick::ZERO)?,
                         None => Tick(source_in.0.checked_add((end.0 - start.0).max(0)).ok_or_else(|| error("source time overflow"))?),
@@ -542,8 +727,10 @@ pub fn read(bytes: &[u8], base_dir: Option<&str>, report: &mut Report) -> Result
                                 }
                             } else if kind == "video" && matches!(match_name, Some("AE.ADBE Lumetri" | "ADBE Lumetri")) {
                                 video_effects.push(color::read(c, &ids, &mut work_left, report)?);
-                            } else if kind == "audio" && matches!(match_name, Some("Internal Volume Stereo" | "Internal Channel Volume Stereo")) {
-                                audio::read(c, &ids, &mut work_left, &mut audio, report)?;
+                            } else if kind == "audio"
+                                && match_name.is_some_and(|m| m.starts_with("Internal Volume") || m.starts_with("Internal Channel Volume"))
+                            {
+                                audio::read(c, match_name.unwrap_or_default(), &ids, &mut work_left, &mut audio, report)?;
                             } else if !is_text && !is_shape {
                                 let count = unsupported_effects.entry((effect.clone(), match_name.unwrap_or("unknown").to_string())).or_insert(0usize);
                                 *count = count.saturating_add(1);
@@ -583,16 +770,53 @@ pub fn read(bytes: &[u8], base_dir: Option<&str>, report: &mut Report) -> Result
                         }
                     }
                     let audio_category = value(item, "ESP.Tag").map(str::to_string);
+                    let disabled =
+                        child(item, "ClipTrackItem").and_then(|c| child_text(c, "IsMuted")).is_some_and(|s| s.eq_ignore_ascii_case("true") || s == "1");
                     let target = source_target(clip, &ids, &uids, &mut work_left)?;
+                    let generated = target.filter(|n| n.has_tag_name("Media")).and_then(|n| Some((n, synthetic_code(n)?)));
+                    let master = referred(sub.and_then(|s| child(s, "MasterClip")), &uids, "ObjectURef");
+                    // An adjustment layer's master clip is flagged over generated black video.
+                    let adjustment_layer = master
+                        .filter(|_| kind == "video")
+                        .filter(|m| child_text(*m, "IsAdjustmentLayer").is_some_and(|v| v.eq_ignore_ascii_case("true") || v == "1"))
+                        .and_then(|m| m.attribute("ObjectUID"))
+                        .map(str::to_string);
+                    let mut synthetic = None;
+                    match &generated {
+                        _ if adjustment_layer.is_some() => {}
+                        // A graphic's canvas; its text and shapes are read from the components.
+                        Some((_, code)) if code == "GRFV" => graphic = true,
+                        // The source of caption clips; their text is read with the caption track.
+                        Some((_, code)) if code == "SCPF" => {}
+                        Some((media, code)) => {
+                            if generator(code).is_none() {
+                                warning(report, format!("{label}: generated media {code} is not supported; kept offline placeholder"));
+                            }
+                            let media = media.attribute("ObjectUID").or_else(|| media.attribute("ObjectID")).unwrap_or("").to_string();
+                            synthetic = Some(SyntheticMedia { code: code.clone(), media });
+                        }
+                        None => {}
+                    }
                     let mut media_path = target.filter(|n| n.has_tag_name("Media")).and_then(|n| media_path(n, base_dir));
                     let mut nested_sequence = target.filter(|n| n.has_tag_name("Sequence")).and_then(|n| n.attribute("ObjectUID")).map(str::to_string);
+                    if adjustment_layer.is_some() {
+                        media_path = None;
+                        nested_sequence = None;
+                    }
                     if graphic {
                         // Generated graphic media may have an internal numeric pseudo-path.
                         // It is a native canvas, not a missing filesystem asset.
                         media_path = None;
                         nested_sequence = None;
                     }
-                    if media_path.is_none() && nested_sequence.is_none() && kind != "caption" && !graphic && text.is_none() {
+                    if media_path.is_none()
+                        && nested_sequence.is_none()
+                        && generated.is_none()
+                        && adjustment_layer.is_none()
+                        && kind != "caption"
+                        && !graphic
+                        && text.is_none()
+                    {
                         let named_sequence = names.get(label.as_str()).copied().flatten();
                         let named_media = media.get(&label);
                         if ambiguous.contains(&label) || names.get(label.as_str()) == Some(&None) || (named_sequence.is_some() && named_media.is_some()) {
@@ -606,14 +830,30 @@ pub fn read(bytes: &[u8], base_dir: Option<&str>, report: &mut Report) -> Result
                     if let Some(path) = &media_path {
                         work_left = work_left.checked_sub(path.len() / 64).ok_or_else(|| error("media reference work limit exceeded"))?;
                     }
+                    let mut media_markers = Vec::new();
+                    if media_path.is_some() {
+                        let first = master.and_then(|m| child(m, "Clips")).and_then(|c| c.children().find(Node::is_element));
+                        // Read once per master clip, onto the first timeline item that uses it:
+                        // re-reading for every cut would repeat the work, the warnings and the copy.
+                        if let Some(master_clip) = referred(first, &ids, "ObjectRef").and_then(|c| child(c, "Clip"))
+                            && marker_owners.insert(master_clip.id())
+                        {
+                            spend(&mut work_left, master_clip)?;
+                            media_markers = markers::read(master_clip, &ids, &mut work_left, report, &label)?;
+                        }
+                    }
                     items.push(Item {
                         object_id: item.attribute("ObjectID").unwrap_or("").into(),
                         link: item.attribute("ObjectID").and_then(|id| links.get(id)).map(|id| (*id).to_string()),
                         audio,
                         video_effects,
                         graphic,
+                        disabled,
                         motion_keys,
                         media_path,
+                        synthetic,
+                        adjustment_layer,
+                        media_markers,
                         nested_sequence,
                         label,
                         start,
@@ -628,10 +868,15 @@ pub fn read(bytes: &[u8], base_dir: Option<&str>, report: &mut Report) -> Result
                         transitions,
                     });
                 }
-                tracks.push(Track { kind: kind.into(), index, muted, items });
+                tracks.push(Track { kind: kind.into(), index, muted, name: track_name, locked, items });
             }
         }
+        if let Some((w, h)) = frame_rect {
+            (width, height) = (w, h);
+        }
+        filmcraft_project::validate_frame_size(width, height).map_err(error)?;
         let object_uid = n.attribute("ObjectUID").ok_or_else(|| error("sequence without ObjectUID"))?.to_string();
+        let markers = markers::read(n, &ids, &mut work_left, report, &name)?;
         sequences.push(Sequence {
             object_uid,
             name,
@@ -640,10 +885,13 @@ pub fn read(bytes: &[u8], base_dir: Option<&str>, report: &mut Report) -> Result
             frame_rate,
             sample_rate,
             work_out: ticks(value(n, "MZ.WorkOutPoint"), Tick::ZERO)?,
+            markers,
             tracks,
         });
     }
-    if sequences.is_empty() {
+    let (bins, items) = items::read(root, &ids, &uids, base_dir, &mut work_left, report)?;
+    // A project with bins or media but no sequence still imports them.
+    if sequences.is_empty() && bins.is_empty() && items.is_empty() {
         return Err(Error::Empty);
     }
     validate_nesting(&sequences)?;
@@ -658,7 +906,8 @@ pub fn read(bytes: &[u8], base_dir: Option<&str>, report: &mut Report) -> Result
         let occurrences = if count == 1 { "occurrence" } else { "occurrences" };
         warning(report, format!("effect {effect} retained in provenance, not rendered ({count} {occurrences}; identifier {identifier})"));
     }
-    Ok(Document { sequences, media })
+    let relative_media = relative_media.into_iter().filter_map(|(path, relative)| Some((path, relative?))).collect();
+    Ok(Document { sequences, media, relative_media, bins, items })
 }
 
 fn validate_nesting(sequences: &[Sequence]) -> Result<()> {
@@ -718,10 +967,17 @@ pub fn import(bytes: &[u8], opts: &ImportOptions, rate: Option<FrameRate>) -> Re
         if src.work_out > Tick::ZERO {
             seq.work_area = Some(filmcraft_time::TimeRange::new(Tick::ZERO, src.work_out));
         }
+        for marker in &src.markers {
+            seq.markers.push(filmcraft_project::Marker { id: filmcraft_project::MarkerId(b.alloc()), ..marker.clone() });
+        }
         for track in &src.tracks {
             if track.kind == "caption" {
                 let mut captions = CaptionTrack::new(TrackId(b.alloc()), format!("Captions {}", track.index + 1), CaptionFormat::Subtitle);
                 captions.enabled = !track.muted;
+                captions.locked = track.locked;
+                if let Some(name) = &track.name {
+                    captions.name = name.clone();
+                }
                 for item in &track.items {
                     captions.captions.push(Caption {
                         id: ClipId(b.alloc()),
@@ -742,17 +998,48 @@ pub fn import(bytes: &[u8], opts: &ImportOptions, rate: Option<FrameRate>) -> Re
             if let Some(t) = seq.tracks_mut(kind).get_mut(track.index) {
                 t.enabled = !track.muted;
                 t.muted = track.muted;
+                t.locked = track.locked;
+                if let Some(name) = &track.name {
+                    t.name = name.clone();
+                }
             }
             let mut transition_ids = BTreeMap::new();
             for item in &track.items {
                 let nested = item.nested_sequence.as_ref().and_then(|n| sequences.get(n)).copied();
+                let adjustment_key = item.adjustment_layer.as_ref().map(|master| format!("premiere-adjustment-layer:{master}"));
                 let source = if let Some(id) = nested {
                     id
+                } else if let Some(key) = &adjustment_key {
+                    // Clips of one adjustment layer share its project item, long enough for each use.
+                    let needed = item.source_out.max(fps.frame_duration());
+                    match b.find_media(key) {
+                        Some(id) => {
+                            if let Some(ItemKind::AdjustmentLayer { duration, .. }) = b.p.item_mut(id).map(|i| &mut i.kind) {
+                                *duration = (*duration).max(needed);
+                            }
+                            id
+                        }
+                        None => {
+                            let kind = ItemKind::AdjustmentLayer { width: src.width, height: src.height, rate: fps, duration: needed };
+                            let id = b.p.add_item(&item.label, Label::Lavender, kind, None);
+                            b.register_media(key, id);
+                            id
+                        }
+                    }
                 } else if item.graphic || item.text.is_some() {
                     if item.text.is_some() {
                         warning(&mut report, "text graphic imported with default font/style; source styling retained in original snapshot");
                     }
                     b.p.add_item(&item.label, Label::Lavender, ItemKind::Graphic { width: src.width, height: src.height, rate: fps }, None)
+                } else if let Some((synthetic, g)) = item.synthetic.as_ref().and_then(|s| Some((s, generator(&s.code)?))) {
+                    // Generated media is not a file: it never reaches the document-path policy or probe.
+                    let key = format!("premiere-generator:{}:{}", synthetic.code, synthetic.media);
+                    if b.find_media(&key).is_none() && matches!(g, filmcraft_media::Generator::ColorMatte { .. }) {
+                        warning(&mut report, format!("{}: colour matte imported black (its colour is not read)", item.label));
+                    }
+                    let audio = matches!(g, filmcraft_media::Generator::BarsAndTone | filmcraft_media::Generator::CountingLeader);
+                    let spec = MediaSpec { video: Some((src.width, src.height, fps)), audio: audio.then_some((48000, 2)), ..Default::default() };
+                    b.generator_media(&key, &item.label, g, &spec, None)
                 } else {
                     let path = item.media_path.clone().unwrap_or_else(|| format!("__missing_premiere__/{}", item.object_id));
                     let spec = MediaSpec {
@@ -762,10 +1049,19 @@ pub fn import(bytes: &[u8], opts: &ImportOptions, rate: Option<FrameRate>) -> Re
                         ..Default::default()
                     };
                     let id = b.file_media(&format!("{}:{path}", track.kind), &item.label, &path, &spec, None);
+                    let media_markers: Vec<_> = item
+                        .media_markers
+                        .iter()
+                        .map(|marker| filmcraft_project::Marker { id: filmcraft_project::MarkerId(b.alloc()), ..marker.clone() })
+                        .collect();
                     if let Some(pi) = b.p.item_mut(id)
                         && let ItemKind::Media(m) = &mut pi.kind
                     {
                         m.offline = true;
+                        // Several timeline clips share one media item; its first markers win.
+                        if m.markers.is_empty() {
+                            m.markers = media_markers;
+                        }
                     }
                     if item.media_path.is_none() {
                         warning(&mut report, format!("{}: media unresolved; kept offline placeholder", item.label));
@@ -774,6 +1070,7 @@ pub fn import(bytes: &[u8], opts: &ImportOptions, rate: Option<FrameRate>) -> Re
                 };
                 let mut clip = b.clip(source, kind, &item.label, item.start, item.end - item.start, item.source_in);
                 clip.speed = item.speed;
+                clip.enabled = !item.disabled;
                 if let Some(link) = &item.link {
                     clip.link = Some(*link_ids.entry(link.clone()).or_insert_with(|| b.alloc()));
                 }
@@ -860,6 +1157,83 @@ pub fn import(bytes: &[u8], opts: &ImportOptions, rate: Option<FrameRate>) -> Re
         seq.check_bounds().map_err(error)?;
         if let Some(id) = sequences.get(&src.object_uid) {
             b.put_sequence(*id, seq);
+        }
+    }
+    // Project panel bins and the items they hold: the timeline's own item where it is the same
+    // source, a new one otherwise. An item listed in several bins stays in the first.
+    let (width, height, fps) = doc.sequences.first().map(|s| (s.width, s.height, rate.or(s.frame_rate).unwrap_or(FrameRate::FPS_24))).unwrap_or((
+        1920,
+        1080,
+        rate.unwrap_or(FrameRate::FPS_24),
+    ));
+    let mut bins = Vec::new();
+    for bin in &doc.bins {
+        let parent = bin.parent.and_then(|i| bins.get(i).copied());
+        bins.push(b.bin(&bin.name, parent));
+    }
+    for entry in &doc.items {
+        let id = if let Some(uid) = &entry.nested_sequence {
+            sequences.get(uid).copied()
+        } else if let Some(master) = &entry.adjustment_layer {
+            let key = format!("premiere-adjustment-layer:{master}");
+            Some(b.find_media(&key).unwrap_or_else(|| {
+                let duration = entry.duration.unwrap_or(Tick::ZERO).max(fps.frame_duration());
+                let id = b.p.add_item(&entry.name, Label::Lavender, ItemKind::AdjustmentLayer { width, height, rate: fps, duration }, None);
+                b.register_media(&key, id);
+                id
+            }))
+        } else {
+            let media = if let Some(path) = &entry.media_path {
+                let spec = MediaSpec {
+                    duration: entry.subclip.as_ref().map(|r| r.end),
+                    video: entry.video.then_some((width, height, fps)),
+                    audio: (!entry.video).then_some((48000, 2)),
+                    ..Default::default()
+                };
+                let kind = if entry.video { "video" } else { "audio" };
+                // A subclip's parent is the media file itself.
+                let file = path.rsplit(['/', '\\']).next().filter(|t| !t.is_empty());
+                let name = if entry.subclip.is_some() { file.unwrap_or(&entry.name) } else { &entry.name };
+                let id = b.file_media(&format!("{kind}:{path}"), name, path, &spec, None);
+                if let Some(ItemKind::Media(m)) = b.p.item_mut(id).map(|i| &mut i.kind) {
+                    m.offline = true;
+                }
+                Some(id)
+            } else if let Some((synthetic, g)) = entry.synthetic.as_ref().and_then(|s| Some((s, generator(&s.code)?))) {
+                let key = format!("premiere-generator:{}:{}", synthetic.code, synthetic.media);
+                let name = if entry.subclip.is_some() { g.label() } else { entry.name.clone() };
+                if b.find_media(&key).is_none() && matches!(g, filmcraft_media::Generator::ColorMatte { .. }) {
+                    warning(&mut report, format!("{name}: colour matte imported black (its colour is not read)"));
+                }
+                let audio = matches!(g, filmcraft_media::Generator::BarsAndTone | filmcraft_media::Generator::CountingLeader);
+                let spec = MediaSpec { video: Some((width, height, fps)), audio: audio.then_some((48000, 2)), ..Default::default() };
+                Some(b.generator_media(&key, &name, g, &spec, None))
+            } else {
+                None
+            };
+            match (media, &entry.subclip) {
+                (Some(parent), Some(range)) => {
+                    let kind = ItemKind::Subclip { parent, range: filmcraft_time::TimeRange::from_bounds(range.start, range.end), restrict_trims: range.hard };
+                    Some(b.p.add_item(&entry.name, Label::Iris, kind, None))
+                }
+                (media, _) => media,
+            }
+        };
+        let root = b.p.root.id;
+        if let (Some(id), Some(bin)) = (id, entry.bin.and_then(|i| bins.get(i).copied()))
+            && b.p.root.parent_of(id) == Some(root)
+        {
+            b.p.move_to_bin(&[id], Some(bin));
+        }
+        // The panel shows media by its master clip name (a rename), not a timeline clip's label.
+        if let Some(id) = id
+            && entry.subclip.is_none()
+            && entry.adjustment_layer.is_none()
+            && entry.nested_sequence.is_none()
+            && !entry.name.is_empty()
+            && let Some(item) = b.p.item_mut(id)
+        {
+            item.name = entry.name.clone();
         }
     }
     Ok((b.finish(), doc, report))
@@ -972,7 +1346,6 @@ mod tests {
             xml.replace("<Start>0", "<Start>NaN"),
             xml.replace(&format!("<End>{}", 3 * TPS), "<End>-1"),
             xml.replace(&format!("<End>{}", 3 * TPS), "<End>invalid"),
-            xml.replace("<InPoint>", "<InPoint>-"),
             xml.replace(&format!("<OutPoint>{}", 10 * TPS), "<OutPoint>-1"),
             xml.replace(&format!("<OutPoint>{}", 10 * TPS), "<OutPoint>invalid"),
             xml.replace("<PlaybackSpeed>2", "<PlaybackSpeed>invalid"),
@@ -980,7 +1353,6 @@ mod tests {
             xml.replace("<PremiereData Version=\"3\">", "<!DOCTYPE x [<!ENTITY a SYSTEM 'file:///etc/passwd'>]><PremiereData Version=\"3\">"),
             xml.replace("<Media>", "<Media ObjectID=\"20\">"),
             xml.replace("1080</MZ.Sequence", "4294967295</MZ.Sequence"),
-            mixed_support_fixture(3 * TPS, "-1", "", "1"),
             mixed_support_fixture(3 * TPS, "invalid", "", "1"),
         ];
         for case in cases {
@@ -1225,6 +1597,7 @@ mod tests {
             audio: BTreeMap::new(),
             video_effects: Vec::new(),
             graphic: false,
+            disabled: false,
             label: name.clone(),
             start: Tick::ZERO,
             end: Tick(TPS),
@@ -1232,6 +1605,9 @@ mod tests {
             source_out: Tick(TPS),
             speed: 1.0,
             media_path: None,
+            synthetic: None,
+            adjustment_layer: None,
+            media_markers: Vec::new(),
             nested_sequence: Some(name),
             text: None,
             audio_category: None,
@@ -1251,7 +1627,8 @@ mod tests {
                 frame_rate: None,
                 sample_rate: None,
                 work_out: Tick::ZERO,
-                tracks: vec![Track { kind: "video".into(), index: 0, muted: false, items }],
+                markers: Vec::new(),
+                tracks: vec![Track { kind: "video".into(), index: 0, muted: false, name: None, locked: false, items }],
             });
         }
         assert!(validate_nesting(&seqs).is_err());
@@ -1308,6 +1685,347 @@ mod tests {
             assert!(tree.sequences[0].tracks[0].items[0].text.is_none());
             assert!(report.mentions("Source Text") && report.mentions("layer name"));
         }
+    }
+    #[test]
+    fn clip_slipped_before_source_start_imports_at_source_start() {
+        // Hand-written: a clip slipped earlier than its source's first frame has a negative in point.
+        let xml = fixture().replace(&format!("<InPoint>{}", 4 * TPS), &format!("<InPoint>-{}", TPS / 3));
+        let (fragment, tree, report) = import(xml.as_bytes(), &ImportOptions::default(), None).unwrap();
+        let item = &tree.sequences[0].tracks[0].items[0];
+        assert_eq!((item.start, item.end, item.source_in, item.source_out), (Tick::ZERO, Tick(3 * TPS), Tick::ZERO, Tick(10 * TPS)));
+        assert_eq!(fragment.project.sequence(fragment.sequences[0]).unwrap().video_tracks[0].items[0].source_in, Tick::ZERO);
+        assert!(report.entries.iter().any(|e| e.message.contains("camera.mov") && e.message.contains("in point")), "{report:?}");
+    }
+    #[test]
+    fn disabled_clips_import_disabled() {
+        // Hand-written: Clip > Enable is stored as the clip track item's IsMuted.
+        let xml = fixture().replace("<SubClip ObjectRef=\"21\"/></ClipTrackItem>", "<SubClip ObjectRef=\"21\"/><IsMuted>true</IsMuted></ClipTrackItem>");
+        let (fragment, tree, _) = import(xml.as_bytes(), &ImportOptions::default(), None).unwrap();
+        assert!(tree.sequences[0].tracks[0].items[0].disabled);
+        let seq = fragment.project.sequence(fragment.sequences[0]).unwrap();
+        assert!(!seq.video_tracks[0].items[0].enabled);
+        assert!(seq.video_tracks[0].enabled, "a disabled clip does not disable its track");
+        let (fragment, _, _) = import(fixture().as_bytes(), &ImportOptions::default(), None).unwrap();
+        assert!(fragment.project.sequence(fragment.sequences[0]).unwrap().video_tracks[0].items[0].enabled);
+    }
+    #[test]
+    fn track_names_and_locks_are_imported() {
+        // Hand-written: a renamed, locked track; names are user text, never resolved as references.
+        let xml = fixture().replace(
+            "<Track><Index>0</Index>",
+            "<Track><Node><Properties><MZ.TrackName>Interviews</MZ.TrackName></Properties></Node><Index>0</Index><IsLocked>true</IsLocked>",
+        );
+        let (fragment, tree, _) = import(xml.as_bytes(), &ImportOptions::default(), None).unwrap();
+        assert_eq!((tree.sequences[0].tracks[0].name.as_deref(), tree.sequences[0].tracks[0].locked), (Some("Interviews"), true));
+        let track = &fragment.project.sequence(fragment.sequences[0]).unwrap().video_tracks[0];
+        assert_eq!((track.name.as_str(), track.locked), ("Interviews", true));
+        let (default, _, _) = import(fixture().as_bytes(), &ImportOptions::default(), None).unwrap();
+        let track = &default.project.sequence(default.sequences[0]).unwrap().video_tracks[0];
+        let blank = xml.replace("<MZ.TrackName>Interviews", "<MZ.TrackName> ");
+        let (blank, _, _) = import(blank.as_bytes(), &ImportOptions::default(), None).unwrap();
+        let blank = &blank.project.sequence(blank.sequences[0]).unwrap().video_tracks[0];
+        assert!(!track.locked && !track.name.is_empty());
+        assert_eq!(blank.name, track.name, "a blank stored name keeps the generated name");
+        let long = xml.replace("Interviews", &"n".repeat(4097));
+        assert!(import(long.as_bytes(), &ImportOptions::default(), None).unwrap_err().to_string().contains("track name"));
+    }
+    // Hand-written marker records in the DVAMarker JSON shape; colours are 0xAABBGGRR.
+    fn marker_fixture() -> String {
+        let record = |id: &str, json: &str| format!(r#"<Marker ObjectID="{id}"><DVAMarker>{}</DVAMarker></Marker>"#, json.replace('"', "&quot;"));
+        let markers = [
+            record("m-comment", r#"{"DVAMarker":{"mComment":"with end","mCuePointList":[{"mKey":"k","mValue":"{\"color\":4281740498}"}],"mDuration":{"ticks":254016000000},"mName":"comment","mStartTime":{"ticks":127008000000},"mType":"Comment"}}"#),
+            record("m-web", r#"{"DVAMarker":{"mLocation":"https://example.com","mName":"web","mStartTime":{"ticks":"381024000000"},"mType":"WebLink"}}"#),
+            record("m-chapter", r#"{"DVAMarker":{"mName":"chapter","mStartTime":{"ticks":0},"mType":"Chapter"}}"#),
+            record("m-bad", "not json"),
+            record("m-media", r#"{"DVAMarker":{"mName":"media note","mStartTime":{"ticks":63504000000},"mType":"Segmentation"}}"#),
+        ]
+        .concat();
+        fixture()
+            .replace("<Name>Sequence 01</Name>", r#"<MarkerOwner><Markers ObjectRef="seq-markers"/></MarkerOwner><Name>Sequence 01</Name>"#)
+            .replace(r#"<Name>camera.mov</Name><Clip ObjectRef="22"/>"#, r#"<Name>camera.mov</Name><MasterClip ObjectURef="master"/><Clip ObjectRef="22"/>"#)
+            .replace(
+                "</PremiereData>",
+                &format!(
+                    r#"<Markers ObjectID="seq-markers"><Markers><Marker Index="0"><Second ObjectRef="m-comment"/></Marker><Marker Index="1"><Second ObjectRef="m-web"/></Marker><Marker Index="2"><Second ObjectRef="m-chapter"/></Marker><Marker Index="3"><Second ObjectRef="m-bad"/></Marker></Markers></Markers>
+<MasterClip ObjectUID="master"><Clips><Clip Index="0" ObjectRef="master-clip"/></Clips></MasterClip>
+<VideoClip ObjectID="master-clip"><Clip><MarkerOwner><Markers ObjectRef="media-markers"/></MarkerOwner></Clip></VideoClip>
+<Markers ObjectID="media-markers"><Markers><Marker Index="0"><Second ObjectRef="m-media"/></Marker></Markers></Markers>
+{markers}</PremiereData>"#
+                ),
+            )
+    }
+    #[test]
+    fn sequence_and_master_clip_markers_are_imported() {
+        let (fragment, _, report) = import(marker_fixture().as_bytes(), &ImportOptions::default(), None).unwrap();
+        let seq = fragment.project.sequence(fragment.sequences[0]).unwrap();
+        let got: Vec<_> = seq.markers.iter().map(|m| (m.start, m.duration, m.name.as_str(), m.comment.as_str(), m.kind)).collect();
+        assert_eq!(
+            got,
+            [
+                (Tick::ZERO, Tick::ZERO, "chapter", "", filmcraft_project::MarkerKind::Chapter),
+                (Tick(TPS / 2), Tick(TPS), "comment", "with end", filmcraft_project::MarkerKind::Comment),
+                (Tick(3 * TPS / 2), Tick::ZERO, "web", "", filmcraft_project::MarkerKind::WebLink),
+            ]
+        );
+        assert_eq!(seq.markers[1].color, Label::Rose, "red cue-point colour");
+        assert_eq!(seq.markers[0].color, Label::Green, "Premiere's default marker colour");
+        assert!(seq.markers.iter().all(|m| seq.markers.iter().filter(|o| o.id == m.id).count() == 1));
+        assert!(report.mentions("web") && report.mentions("URL"), "{report:?}");
+        assert!(report.mentions("marker could not be read"), "{report:?}");
+        let clip = &seq.video_tracks[0].items[0];
+        let ItemKind::Media(media) = &fragment.project.item(clip.item).unwrap().kind else { panic!() };
+        assert_eq!(
+            media.markers.iter().map(|m| (m.start, m.name.as_str(), m.kind)).collect::<Vec<_>>(),
+            [(Tick(TPS / 4), "media note", filmcraft_project::MarkerKind::Segmentation)]
+        );
+    }
+    #[test]
+    fn master_clip_markers_are_read_once_however_often_the_media_is_cut() {
+        // A second cut of the same media; its master clip holds a web-link marker, whose URL
+        // warning would repeat for every cut if the markers were read per timeline item.
+        let xml = marker_fixture()
+            .replace(r#"<TrackItem ObjectRef="20"/>"#, r#"<TrackItem ObjectRef="20"/><TrackItem ObjectRef="20b"/>"#)
+            .replace(
+                r#"<Second ObjectRef="m-media"/></Marker>"#,
+                r#"<Second ObjectRef="m-media"/></Marker><Marker Index="1"><Second ObjectRef="m-web"/></Marker>"#,
+            )
+            .replace(
+                "</PremiereData>",
+                &format!(
+                    r#"<VideoClipTrackItem ObjectID="20b"><ClipTrackItem><TrackItem><Start>{}</Start><End>{}</End></TrackItem><SubClip ObjectRef="21"/></ClipTrackItem></VideoClipTrackItem></PremiereData>"#,
+                    3 * TPS,
+                    6 * TPS
+                ),
+            );
+        let (fragment, tree, report) = import(xml.as_bytes(), &ImportOptions::default(), None).unwrap();
+        let items = &tree.sequences[0].tracks[0].items;
+        assert_eq!(items.iter().map(|i| i.media_markers.len()).collect::<Vec<_>>(), [2, 0]);
+        assert_eq!(report.entries.iter().filter(|e| e.message.contains("camera.mov: marker web")).count(), 1, "{report:?}");
+        let seq = fragment.project.sequence(fragment.sequences[0]).unwrap();
+        let ItemKind::Media(media) = &fragment.project.item(seq.video_tracks[0].items[1].item).unwrap().kind else { panic!() };
+        assert_eq!(media.markers.len(), 2, "every cut shows the media's markers");
+    }
+    #[test]
+    fn more_markers_than_the_limit_are_truncated_with_a_warning() {
+        let entries: String = (0..10_001).map(|i| format!(r#"<Marker Index="{i}"><Second ObjectRef="m-chapter"/></Marker>"#)).collect();
+        let xml = marker_fixture().replace(
+            r#"<Marker Index="0"><Second ObjectRef="m-comment"/></Marker><Marker Index="1"><Second ObjectRef="m-web"/></Marker><Marker Index="2"><Second ObjectRef="m-chapter"/></Marker><Marker Index="3"><Second ObjectRef="m-bad"/></Marker>"#,
+            &entries,
+        );
+        let (fragment, _, report) = import(xml.as_bytes(), &ImportOptions::default(), None).unwrap();
+        assert_eq!(fragment.project.sequence(fragment.sequences[0]).unwrap().markers.len(), 10_000);
+        assert!(report.mentions("more than 10000 markers"), "{report:?}");
+    }
+    #[test]
+    fn hostile_marker_records_never_panic_or_escape_bounds() {
+        let base = marker_fixture();
+        for bad in ["{\"ticks\":-5}", "{\"ticks\":9223372036854775807}", "{\"ticks\":1.5}", "{\"ticks\":\"x\"}", "[]", "null"] {
+            let xml = base.replace("{&quot;ticks&quot;:0}", &bad.replace('"', "&quot;"));
+            let result = std::panic::catch_unwind(|| import(xml.as_bytes(), &ImportOptions::default(), None)).unwrap();
+            let (fragment, _, _) = result.unwrap_or_else(|e| panic!("{bad}: {e}"));
+            let seq = fragment.project.sequence(fragment.sequences[0]).unwrap();
+            assert!(seq.markers.iter().all(|m| m.start >= Tick::ZERO && m.duration >= Tick::ZERO && m.start.0 + m.duration.0 <= Tick::MAX.0), "{bad}");
+        }
+        let cyclic = base.replace(r#"<Second ObjectRef="m-comment"/>"#, r#"<Second ObjectRef="seq-markers"/>"#);
+        assert!(std::panic::catch_unwind(|| import(cyclic.as_bytes(), &ImportOptions::default(), None)).unwrap().is_ok());
+    }
+    #[test]
+    fn paths_saved_on_another_system_use_the_relative_path() {
+        // Hand-written: Media keeps the absolute path where it was saved and a project-relative one.
+        let media = |absolute: &str, relative: &str| {
+            fixture().replace(
+                "<ActualMediaFilePath>/missing/camera.mov</ActualMediaFilePath>",
+                &format!("<ActualMediaFilePath>{absolute}</ActualMediaFilePath><RelativePath>{relative}</RelativePath>"),
+            )
+        };
+        let read_with = |xml: &str, base: &str| read(xml.as_bytes(), Some(base), &mut Report::default()).unwrap();
+        let cases = [
+            ("/Users/editor/Shoot/camera.mov", r"..\Shoot\camera.mov", r"D:\Edit\Project", r"D:\Edit\Shoot\camera.mov"),
+            (r"C:\Users\editor\Shoot\camera.mov", "../Shoot/camera.mov", "/home/editor/Project", "/home/editor/Shoot/camera.mov"),
+            (r"\\server\share\camera.mov", "camera.mov", "/home/editor/Project", "/home/editor/Project/camera.mov"),
+        ];
+        for (absolute, relative, base, expected) in cases {
+            let doc = read_with(&media(absolute, relative), base);
+            assert_eq!(doc.sequences[0].tracks[0].items[0].media_path.as_deref(), Some(expected), "{absolute}");
+            assert!(doc.relative_media.is_empty());
+        }
+        // Same system: the absolute path stays first; the relative one is the engine's fallback.
+        let doc = read_with(&media("/Volumes/Shoot/camera.mov", "../Shoot/camera.mov"), "/Users/editor/Project");
+        assert_eq!(doc.sequences[0].tracks[0].items[0].media_path.as_deref(), Some("/Volumes/Shoot/camera.mov"));
+        assert_eq!(doc.relative_media.get("/Volumes/Shoot/camera.mov").map(String::as_str), Some("/Users/editor/Shoot/camera.mov"));
+        // Without a project folder, or without a relative path, nothing changes.
+        let doc = read(media("/Users/editor/Shoot/camera.mov", r"..\Shoot\camera.mov").as_bytes(), None, &mut Report::default()).unwrap();
+        assert_eq!(doc.sequences[0].tracks[0].items[0].media_path.as_deref(), Some("/Users/editor/Shoot/camera.mov"));
+        let doc = read_with(&fixture(), r"D:\Edit\Project");
+        assert_eq!(doc.sequences[0].tracks[0].items[0].media_path.as_deref(), Some("/missing/camera.mov"));
+        // A "relative" path that climbs onto another drive is never joined to the project folder.
+        let doc = read_with(&media(r"C:\Users\editor\Shoot\camera.mov", r"..\..\C:\Users\editor\Shoot\camera.mov"), "/home/editor/Project");
+        assert_eq!(doc.sequences[0].tracks[0].items[0].media_path.as_deref(), Some(r"C:\Users\editor\Shoot\camera.mov"));
+        assert!(doc.relative_media.is_empty());
+        let long = media("/Users/editor/camera.mov", &"r".repeat(16385));
+        assert!(read(long.as_bytes(), Some("/x"), &mut Report::default()).unwrap_err().to_string().contains("too long"));
+    }
+    // Hand-written: generated media stores a four-character code as its file path, so its title
+    // is UI-language text (here Spanish) and never a file to probe.
+    fn generator_fixture(code: u32, title: &str) -> String {
+        fixture().replace("<PlaybackSpeed>2</PlaybackSpeed>", "<PlaybackSpeed>1</PlaybackSpeed><Source ObjectRef=\"23\"/>").replace(
+            "<Media><Title>camera.mov</Title><ActualMediaFilePath>/missing/camera.mov</ActualMediaFilePath></Media>",
+            &format!(
+                r#"<VideoMediaSource ObjectID="23"><MediaSource><Media ObjectURef="generated"/></MediaSource></VideoMediaSource>
+<Media ObjectUID="generated"><FilePath>{code}</FilePath><Title>{title}</Title><ActualMediaFilePath>{code}</ActualMediaFilePath></Media>"#
+            ),
+        )
+    }
+    #[test]
+    fn generated_media_imports_by_four_character_code() {
+        use filmcraft_media::Generator;
+        let code = |c: &[u8; 4]| u32::from_be_bytes(*c);
+        let cases = [
+            (b"BLAK", Generator::BlackVideo),
+            (b"COLR", Generator::ColorMatte { color: [0.0, 0.0, 0.0, 1.0] }),
+            (b"BARS", Generator::BarsAndTone),
+            (b"TRNV", Generator::TransparentVideo),
+            (b"LEAD", Generator::CountingLeader),
+        ];
+        for (fourcc, expected) in cases {
+            let xml = generator_fixture(code(fourcc), "Vídeo generado");
+            let (fragment, tree, report) = import(xml.as_bytes(), &ImportOptions { base_dir: Some("/project".into()), ..Default::default() }, None).unwrap();
+            let item = &tree.sequences[0].tracks[0].items[0];
+            assert_eq!(item.media_path, None, "a code is not a file path");
+            assert!(tree.media.is_empty() && tree.relative_media.is_empty());
+            let clip = &fragment.project.sequence(fragment.sequences[0]).unwrap().video_tracks[0].items[0];
+            let ItemKind::Media(media) = &fragment.project.item(clip.item).unwrap().kind else { panic!("{report:?}") };
+            assert_eq!(media.media, filmcraft_project::MediaRef::Generator(expected.clone()));
+            assert!(!media.offline);
+            assert!(!report.mentions("unresolved"), "{report:?}");
+            assert_eq!(report.mentions("colour is not read"), matches!(expected, Generator::ColorMatte { .. }), "{report:?}");
+        }
+        // A graphic's canvas is a native graphic, not media.
+        let (fragment, _, _) = import(generator_fixture(code(b"GRFV"), "Gráfico").as_bytes(), &ImportOptions::default(), None).unwrap();
+        let clip = &fragment.project.sequence(fragment.sequences[0]).unwrap().video_tracks[0].items[0];
+        assert!(matches!(fragment.project.item(clip.item).unwrap().kind, ItemKind::Graphic { .. }));
+        // An unknown code stays a visible offline placeholder and is reported, never probed as a path.
+        let (fragment, tree, report) = import(generator_fixture(code(b"ZZZZ"), "Unknown").as_bytes(), &ImportOptions::default(), None).unwrap();
+        assert_eq!(tree.sequences[0].tracks[0].items[0].media_path, None);
+        assert!(report.mentions("ZZZZ"), "{report:?}");
+        let clip = &fragment.project.sequence(fragment.sequences[0]).unwrap().video_tracks[0].items[0];
+        assert!(fragment.project.item(clip.item).and_then(|i| i.as_media()).is_some_and(|m| m.offline));
+    }
+    #[test]
+    fn adjustment_layers_import_as_adjustment_layers() {
+        // Hand-written: an adjustment layer is a master clip flagged IsAdjustmentLayer over black video.
+        let xml = generator_fixture(u32::from_be_bytes(*b"BLAK"), "Capa de ajuste")
+            .replace(r#"<Name>camera.mov</Name><Clip ObjectRef="22"/>"#, r#"<Name>Grade</Name><MasterClip ObjectURef="layer"/><Clip ObjectRef="22"/>"#)
+            .replace("</PremiereData>", r#"<MasterClip ObjectUID="layer"><Clips><Clip Index="0" ObjectRef="22"/></Clips><Name>Grade</Name><IsAdjustmentLayer>true</IsAdjustmentLayer></MasterClip></PremiereData>"#);
+        let (fragment, tree, report) = import(xml.as_bytes(), &ImportOptions::default(), None).unwrap();
+        let item = &tree.sequences[0].tracks[0].items[0];
+        assert!(item.synthetic.is_none() && item.media_path.is_none());
+        let clip = &fragment.project.sequence(fragment.sequences[0]).unwrap().video_tracks[0].items[0];
+        let layer = fragment.project.item(clip.item).unwrap();
+        assert_eq!(layer.name, "Grade");
+        let ItemKind::AdjustmentLayer { width, height, duration, .. } = layer.kind else { panic!("{:?} {report:?}", layer.kind) };
+        assert_eq!((width, height), (1080, 1920), "the sequence frame");
+        assert!(duration >= clip.source_in + clip.duration, "covers the clip's source range");
+        assert!(!report.mentions("unresolved") && !report.mentions("offline"), "{report:?}");
+        // The same master clip without the flag is plain black video.
+        let plain = xml.replace("<IsAdjustmentLayer>true", "<IsAdjustmentLayer>false");
+        let (fragment, _, _) = import(plain.as_bytes(), &ImportOptions::default(), None).unwrap();
+        let clip = &fragment.project.sequence(fragment.sequences[0]).unwrap().video_tracks[0].items[0];
+        assert!(fragment.project.item(clip.item).and_then(|i| i.as_media()).is_some_and(|m| matches!(m.media, filmcraft_project::MediaRef::Generator(_))));
+    }
+    // Hand-written project panel: Project → RootProjectItem → ClipProjectItem → MasterClip, whose
+    // clip's media source carries the subclip boundaries.
+    fn subclip_fixture(boundaries: &str) -> String {
+        fixture().replace(
+            "</PremiereData>",
+            &format!(
+                r#"<Project ObjectRef="project"/><Project ObjectID="project"><RootProjectItem ObjectURef="root"/></Project>
+<RootProjectItem ObjectUID="root"><ProjectItem><Name>Root Bin</Name></ProjectItem><ProjectItemContainer><Items><Item Index="0" ObjectURef="answer"/><Item Index="1" ObjectURef="root"/></Items></ProjectItemContainer></RootProjectItem>
+<ClipProjectItem ObjectUID="answer"><ProjectItem><Name>interview.mov</Name></ProjectItem><MasterClip ObjectURef="answer-master"/></ClipProjectItem>
+<MasterClip ObjectUID="answer-master"><Clips><Clip Index="0" ObjectRef="answer-clip"/></Clips><Name>Answer</Name></MasterClip>
+<VideoClip ObjectID="answer-clip"><Clip><Source ObjectRef="answer-source"/></Clip></VideoClip>
+<VideoMediaSource ObjectID="answer-source"><MediaSource><Content>{boundaries}</Content><Media ObjectURef="interview"/></MediaSource></VideoMediaSource>
+<Media ObjectUID="interview"><Title>interview.mov</Title><ActualMediaFilePath>/media/interview.mov</ActualMediaFilePath></Media></PremiereData>"#
+            ),
+        )
+    }
+    #[test]
+    fn subclips_import_as_project_items() {
+        let bounds = |start: i64, end: i64, hard: bool| {
+            format!("<StartBoundary>{start}</StartBoundary><EndBoundary>{end}</EndBoundary><BoundariesAreHard>{hard}</BoundariesAreHard>")
+        };
+        let (fragment, tree, report) = import(subclip_fixture(&bounds(TPS, 3 * TPS, true)).as_bytes(), &ImportOptions::default(), None).unwrap();
+        assert_eq!(tree.items.len(), 1, "{report:?}");
+        let subclips: Vec<_> = fragment.project.items.values().filter(|i| matches!(i.kind, ItemKind::Subclip { .. })).collect();
+        assert_eq!(subclips.len(), 1, "{report:?}");
+        assert_eq!(subclips[0].name, "Answer", "a renamed subclip keeps its master clip name");
+        let ItemKind::Subclip { parent, range, restrict_trims } = &subclips[0].kind else { unreachable!() };
+        assert_eq!((range.start, range.duration, *restrict_trims), (Tick(TPS), Tick(2 * TPS), true));
+        let parent = fragment.project.item(*parent).and_then(|i| i.as_media()).unwrap();
+        assert_eq!(parent.media, filmcraft_project::MediaRef::File { path: "/media/interview.mov".into() });
+        assert!(parent.offline, "the engine probes it like timeline media");
+        // A master clip without boundaries is not a subclip; hostile boundaries are skipped and reported.
+        let (fragment, tree, _) = import(subclip_fixture("").as_bytes(), &ImportOptions::default(), None).unwrap();
+        assert!(tree.items.iter().all(|e| e.subclip.is_none()) && !fragment.project.items.values().any(|i| matches!(i.kind, ItemKind::Subclip { .. })));
+        for bad in [bounds(3 * TPS, TPS, false), bounds(-TPS, TPS, false), "<StartBoundary>x</StartBoundary><EndBoundary>1</EndBoundary>".into()] {
+            let (fragment, _, report) = import(subclip_fixture(&bad).as_bytes(), &ImportOptions::default(), None).unwrap();
+            assert!(!fragment.project.items.values().any(|i| matches!(i.kind, ItemKind::Subclip { .. })), "{bad}");
+            assert!(report.mentions("Answer") && report.mentions("subclip"), "{bad}: {report:?}");
+        }
+    }
+    // Hand-written project panel: nested bins, a timeline clip's media filed in a sub-bin, the
+    // sequence at the root, bin-only black video, and a search bin.
+    fn bins_fixture() -> String {
+        let black = u32::from_be_bytes(*b"BLAK");
+        fixture().replace(
+            "</PremiereData>",
+            &format!(
+                r#"<Project ObjectRef="project"/><Project ObjectID="project"><RootProjectItem ObjectURef="root"/></Project>
+<RootProjectItem ObjectUID="root"><ProjectItem><Name>Root Bin</Name></ProjectItem><ProjectItemContainer><Items><Item Index="0" ObjectURef="footage"/><Item Index="1" ObjectURef="sequence-item"/><Item Index="2" ObjectURef="search"/><Item Index="3" ObjectURef="unused"/></Items></ProjectItemContainer></RootProjectItem>
+<BinProjectItem ObjectUID="footage"><ProjectItem><Name>Footage</Name></ProjectItem><ProjectItemContainer><Items><Item Index="0" ObjectURef="selects"/></Items></ProjectItemContainer></BinProjectItem>
+<BinProjectItem ObjectUID="selects"><ProjectItem><Name>Selects</Name></ProjectItem><ProjectItemContainer><Items><Item Index="0" ObjectURef="camera-item"/><Item Index="1" ObjectURef="footage"/></Items></ProjectItemContainer></BinProjectItem>
+<BinProjectItem ObjectUID="unused"><ProjectItem><Name>Unused</Name></ProjectItem><ProjectItemContainer><Items><Item Index="0" ObjectURef="black-item"/></Items></ProjectItemContainer></BinProjectItem>
+<SmartBinProjectItem ObjectUID="search"><BinProjectItem><ProjectItem><Name>Reds</Name></ProjectItem></BinProjectItem></SmartBinProjectItem>
+<ClipProjectItem ObjectUID="camera-item"><ProjectItem><Name>camera.mov</Name></ProjectItem><MasterClip ObjectURef="camera-master"/></ClipProjectItem>
+<MasterClip ObjectUID="camera-master"><Clips><Clip Index="0" ObjectRef="camera-clip"/></Clips><Name>Camera A</Name></MasterClip>
+<VideoClip ObjectID="camera-clip"><Clip><Source ObjectRef="camera-source"/></Clip></VideoClip>
+<VideoMediaSource ObjectID="camera-source"><MediaSource><Media ObjectURef="camera-media"/></MediaSource></VideoMediaSource>
+<Media ObjectUID="camera-media"><Title>camera.mov</Title><ActualMediaFilePath>/missing/camera.mov</ActualMediaFilePath></Media>
+<ClipProjectItem ObjectUID="sequence-item"><ProjectItem><Name>Sequence 01</Name></ProjectItem><MasterClip ObjectURef="sequence-master"/></ClipProjectItem>
+<MasterClip ObjectUID="sequence-master"><Clips><Clip Index="0" ObjectRef="sequence-clip"/></Clips><Name>Sequence 01</Name></MasterClip>
+<VideoClip ObjectID="sequence-clip"><Clip><Source ObjectRef="sequence-source"/></Clip></VideoClip>
+<VideoSequenceSource ObjectID="sequence-source"><SequenceSource><Sequence ObjectURef="sequence"/></SequenceSource></VideoSequenceSource>
+<ClipProjectItem ObjectUID="black-item"><ProjectItem><Name>Vídeo negro</Name></ProjectItem><MasterClip ObjectURef="black-master"/></ClipProjectItem>
+<MasterClip ObjectUID="black-master"><Clips><Clip Index="0" ObjectRef="black-clip"/></Clips><Name>Vídeo negro</Name></MasterClip>
+<VideoClip ObjectID="black-clip"><Clip><Source ObjectRef="black-source"/></Clip></VideoClip>
+<VideoMediaSource ObjectID="black-source"><MediaSource><Media ObjectURef="black-media"/></MediaSource></VideoMediaSource>
+<Media ObjectUID="black-media"><Title>Vídeo negro</Title><FilePath>{black}</FilePath></Media></PremiereData>"#
+            ),
+        )
+    }
+    #[test]
+    fn bins_and_their_items_are_imported() {
+        let (fragment, tree, report) = import(bins_fixture().as_bytes(), &ImportOptions::default(), None).unwrap();
+        let names: Vec<_> = tree.bins.iter().map(|b| (b.name.as_str(), b.parent)).collect();
+        assert_eq!(names, [("Footage", None), ("Selects", Some(0)), ("Unused", None)], "a bin listing its parent is read once");
+        let p = &fragment.project;
+        let bin_of = |id: filmcraft_project::ItemId| p.root.parent_of(id).and_then(|b| p.root.find_bin(b)).map(|b| b.name.clone());
+        let clip = &p.sequence(fragment.sequences[0]).unwrap().video_tracks[0].items[0];
+        assert_eq!(bin_of(clip.item).as_deref(), Some("Selects"), "timeline media sits in its bin");
+        assert_eq!((p.item(clip.item).unwrap().name.as_str(), clip.name.as_str()), ("Camera A", "camera.mov"), "renamed in the panel only");
+        assert_eq!(bin_of(fragment.sequences[0]), Some(p.root.name.clone()), "the sequence stays at the root");
+        let black = p.items.values().find(|i| i.name == "Vídeo negro").unwrap();
+        assert!(matches!(&black.kind, ItemKind::Media(m) if matches!(m.media, filmcraft_project::MediaRef::Generator(filmcraft_media::Generator::BlackVideo))));
+        assert_eq!(bin_of(black.id).as_deref(), Some("Unused"), "bin-only media is imported into its bin");
+        assert!(report.mentions("Reds") && report.mentions("search bin"), "{report:?}");
+        // Media and bins without any sequence still import.
+        let no_sequence = bins_fixture().replace(r#"<Sequence ObjectUID="sequence">"#, r#"<Unused ObjectUID="sequence">"#).replace("</Sequence>", "</Unused>");
+        let (fragment, tree, _) = import(no_sequence.as_bytes(), &ImportOptions::default(), None).unwrap();
+        assert!(fragment.sequences.is_empty() && tree.sequences.is_empty());
+        assert!(fragment.project.items.values().any(|i| i.name == "Camera A" && i.as_media().is_some()));
+        // A project with neither sequences nor project items is still empty.
+        let empty = r#"<PremiereData><Project ObjectID="p"><RootProjectItem ObjectURef="r"/></Project><RootProjectItem ObjectUID="r"/></PremiereData>"#;
+        assert!(matches!(import(empty.as_bytes(), &ImportOptions::default(), None), Err(Error::Empty)));
     }
     #[test]
     fn speed_reads_stored_ratio_not_frame_grid_durations() {
